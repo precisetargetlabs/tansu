@@ -1,0 +1,32 @@
+# mise configuration for tiros-engine
+# https://mise.jdx.dev/
+
+[tools]
+rust = "1.93"
+python = "3.12"
+uv = "latest"
+just = "latest"
+
+[env]
+RUST_BACKTRACE = "1"
+RUST_LOG = "info"
+
+[tasks.check]
+description = "Run cargo check"
+run = "cargo check --workspace"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test --workspace"
+
+[tasks.fmt]
+description = "Format code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Run clippy"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.build]
+description = "Build release"
+run = "cargo build --release"

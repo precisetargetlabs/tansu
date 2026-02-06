@@ -1,0 +1,61 @@
+# pixi configuration for tiros-engine
+# https://pixi.sh/
+#
+# Provides isolated, reproducible environments for development and CI.
+# Run `pixi install` to set up the environment.
+
+[project]
+name = "tiros-engine"
+version = "0.1.0"
+description = "Kafka-compatible streaming platform with S3-backed storage"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+[dependencies]
+# Rust toolchain
+rust = ">=1.93"
+cargo = ">=1.93"
+
+# Build tools
+cmake = ">=3.28"
+pkg-config = "*"
+openssl = ">=3.0"
+
+# Development tools
+just = ">=1.36"
+git = ">=2.40"
+
+# Python (for scripts/tooling)
+python = ">=3.12"
+uv = ">=0.5"
+
+# Testing infrastructure
+docker-compose = ">=2.0"
+kubectl = ">=1.29"
+
+[feature.dev.dependencies]
+# Additional dev-only tools
+ripgrep = "*"
+fd-find = "*"
+hyperfine = "*"
+tokei = "*"
+
+[environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[tasks]
+check = "cargo check --workspace"
+test = "cargo test --workspace"
+fmt = "cargo fmt --all"
+lint = "cargo clippy --workspace --all-targets -- -D warnings"
+build = "cargo build --release"
+broker = "cargo run --release --bin tansu-broker"
+
+[tasks.up]
+description = "Start local development stack"
+cmd = "docker compose up -d"
+
+[tasks.down]
+description = "Stop local development stack"
+cmd = "docker compose down"
