@@ -114,6 +114,7 @@
 use async_trait::async_trait;
 use bytes::{Bytes, TryGetError};
 
+use console::Emoji;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use deadpool::managed::PoolError;
 #[cfg(feature = "dynostore")]
@@ -121,6 +122,7 @@ use dynostore::DynoStore;
 
 use glob::{GlobError, PatternError};
 
+use indicatif::{ProgressBar, ProgressStyle};
 #[cfg(feature = "dynostore")]
 use object_store::memory::InMemory;
 
@@ -294,6 +296,8 @@ pub enum Error {
 
     Regex(#[from] regex::Error),
     Schema(Arc<tansu_schema::Error>),
+
+    Rustls(#[from] rustls::Error),
 
     SegmentEmpty(Topition),
 
@@ -1596,6 +1600,7 @@ pub struct Builder<N, C, A, S> {
     storage: S,
     schema_registry: Option<Registry>,
     lake_house: Option<House>,
+    silent: bool,
 
     cancellation: CancellationToken,
 }
@@ -1612,6 +1617,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             storage: self.storage,
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
+            silent: self.silent,
             cancellation: self.cancellation,
         }
     }
@@ -1624,6 +1630,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             storage: self.storage,
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
+            silent: self.silent,
             cancellation: self.cancellation,
         }
     }
@@ -1636,6 +1643,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             storage: self.storage,
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
+            silent: self.silent,
             cancellation: self.cancellation,
         }
     }
@@ -1650,6 +1658,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             storage,
             schema_registry: self.schema_registry,
             lake_house: self.lake_house,
+            silent: self.silent,
             cancellation: self.cancellation,
         }
     }
@@ -1678,6 +1687,10 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             cancellation,
             ..self
         }
+    }
+
+    pub fn silent(self, silent: bool) -> Self {
+        Self { silent, ..self }
     }
 }
 
@@ -1849,7 +1862,28 @@ impl Builder<i32, String, Url, Url> {
             _unsupported => Err(Error::UnsupportedStorageUrl(self.storage.clone())),
         }?;
 
+        let pb = if self.silent {
+            None
+        } else {
+            let pb = ProgressBar::new(1);
+            pb.set_style(
+                ProgressStyle::with_template("[{elapsed}] {bar:40.cyan/blue} {msg}")
+                    .unwrap()
+                    .progress_chars("##-"),
+            );
+
+            pb.set_message("connecting to storage");
+
+            Some(pb)
+        };
+
         storage.ping().await?;
+
+        if let Some(pb) = pb {
+            pb.inc(1);
+            pb.finish_with_message(format!("{} connected to storage", Emoji("✅", ""),));
+        }
+
         Ok(storage)
     }
 }

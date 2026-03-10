@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -227,9 +227,11 @@ pub enum Error {
     InvalidOpType(i8),
     Io(Arc<io::Error>),
     Message(String),
+    MessageMaxSizeExceeded(usize),
     NoSuchField(&'static str),
     NoSuchMessage(&'static str),
     NoSuchRequest(i16),
+    Overflow,
     ParseFilter(Arc<ParseError>),
     ResponseFrame,
     Snap(#[from] snap::Error),
@@ -243,6 +245,7 @@ pub enum Error {
     UnexpectedType(String),
     UnknownApiErrorCode(i16),
     UnknownCompressionType(i16),
+    UnknownContainer,
     Utf8(str::Utf8Error),
 }
 
@@ -2076,7 +2079,18 @@ pub trait Decode: Sized {
 
 #[cfg(test)]
 mod tests {
+    use std::thread::sleep;
+
     use super::*;
+
+    #[test]
+    fn frame_elapsed_millis() {
+        let pause = 6;
+        let now = SystemTime::now();
+        sleep(Duration::from_millis(pause));
+
+        assert!(Frame::elapsed_millis(now) >= pause);
+    }
 
     #[test]
     fn batch_attribute() {
