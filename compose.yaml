@@ -1,9 +1,12 @@
 ---
+# Each service publishes its ports on 127.0.0.1 only, so that only this
+# computer can connect. The broker does not authenticate clients by default,
+# and the other services use well-known passwords or anonymous access.
 services:
   grafana:
-    image: grafana/grafana:11.5.1
+    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
     ports:
-      - 3000:3000
+      - 127.0.0.1:3000:3000
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: true
       GF_AUTH_ANONYMOUS_HIDE_VERSION: true
@@ -21,29 +24,38 @@ services:
       - grafana:/var/lib/grafana
     pull_policy: missing
   db:
-    image: ${POSTGRES_IMAGE:-postgres:17}
+    image: ${POSTGRES_IMAGE:-postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336}
     environment:
       PGUSER: postgres
       POSTGRES_PASSWORD: postgres
+    # The default of 100 is too few for a test run, whose tests each open a
+    # pool of connections, beside the lakehouse catalog's own pool.
+    command: postgres -c max_connections=300
+    # nisshi-smoke-test/run.sh and etc/worktree-services.sh set NISSHI_DB_PORTS, so that Docker picks the host port.
     ports:
-      - 5432:5432
+      - ${NISSHI_DB_PORTS:-127.0.0.1:5432:5432}
     volumes:
       - db:/var/lib/postgresql
-      - ./etc/initdb.d/:/docker-entrypoint-initdb.d/
     healthcheck:
-      test: /usr/bin/pg_isready
+      # pg_isready checks TCP, not the socket: on a new volume, the server
+      # listens only on the socket while its init scripts run.
+      test: /usr/bin/pg_isready --host=localhost
       interval: 5s
       timeout: 10s
       retries: 5
     pull_policy: missing
   minio:
-    image: quay.io/minio/minio
+    # MinIO no longer publishes images. pgsty/silo is a community-maintained
+    # AGPLv3 fork that still does, multi-arch, with mc at /usr/bin/mc and the
+    # MinIO S3 API, including conditional writes.
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
     command: server /data --console-address ":9001"
     volumes:
       - minio:/data
+    # nisshi-smoke-test/run.sh and etc/worktree-services.sh set these variables, so that Docker picks the host ports.
     ports:
-      - 9000:9000
-      - 9001:9001
+      - ${NISSHI_MINIO_PORTS:-127.0.0.1:9000:9000}
+      - ${NISSHI_MINIO_CONSOLE_PORTS:-127.0.0.1:9001:9001}
     environment:
       MINIO_PROMETHEUS_AUTH_TYPE: public
     healthcheck:
@@ -52,54 +64,75 @@ services:
       retries: 1
       start_period: 5s
       timeout: 5s
-  tansu:
-    image: ${TANSU_IMAGE}
+    pull_policy: missing
+  # Each variable has a default, so that `docker compose up -d nisshi` works
+  # without a .env. The defaults run the latest release on PostgreSQL. A .env
+  # (see example.env) overrides any of them.
+  nisshi:
+    # :latest is the latest release. Set NISSHI_IMAGE to
+    # ghcr.io/nisshi-io/nisshi:edge for a build of main.
+    image: ${NISSHI_IMAGE:-ghcr.io/nisshi-io/nisshi:latest}
     restart: unless-stopped
     environment:
-      RUST_BACKTRACE: ${RUST_BACKTRACE}
-      RUST_LOG: ${RUST_LOG}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      AWS_ENDPOINT: ${AWS_ENDPOINT}
-      AWS_ALLOW_HTTP: ${AWS_ALLOW_HTTP}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-0}
+      RUST_LOG: ${RUST_LOG:-warn}
+      # The local credentials of the minio service above. They are not AWS
+      # credentials, and the s3:// storage engine needs no AWS account.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      AWS_ENDPOINT: ${AWS_ENDPOINT:-http://minio:9000}
+      AWS_ALLOW_HTTP: ${AWS_ALLOW_HTTP:-true}
     volumes:
       - ./etc/schema/:/schema/
       - ./data:/data/
     command: |
-      --kafka-cluster-id ${CLUSTER_ID}
+      --kafka-cluster-id ${CLUSTER_ID:-nisshi}
       --kafka-listener-url tcp://0.0.0.0:9092/
-      --kafka-advertised-listener-url ${ADVERTISED_LISTENER_URL}
-      --storage-engine ${STORAGE_ENGINE}
+      --kafka-advertised-listener-url ${ADVERTISED_LISTENER_URL:-tcp://localhost:9092}
+      --storage-engine ${STORAGE_ENGINE:-postgres://postgres:postgres@db}
       --schema-registry file:///schema
+    # The broker exits when its storage engine is unreachable at startup, so
+    # it waits for the default engine, PostgreSQL. With another engine,
+    # `docker compose up nisshi` still starts db.
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
-      - 9092:9092
-      - 9100:9100
+      - 127.0.0.1:9092:9092
+      - 127.0.0.1:9100:9100
   jaeger:
-    image: jaegertracing/all-in-one
+    # Jaeger v1 (jaegertracing/all-in-one) is end of life. Jaeger v2 ships
+    # under a different image name, jaegertracing/jaeger, so a move to v2
+    # needs more than a tag bump.
+    image: jaegertracing/all-in-one:1.76.0@sha256:ab6f1a1f0fb49ea08bcd19f6b84f6081d0d44b364b6de148e1798eb5816bacac
     ports:
-      - 16686:16686
-      - 4317:4317
-      - 4318:4318
-      - 5778:5778
-      - 9411:9411
+      - 127.0.0.1:16686:16686
+      - 127.0.0.1:4317:4317
+      - 127.0.0.1:4318:4318
+      - 127.0.0.1:5778:5778
+      - 127.0.0.1:9411:9411
   prometheus:
-    image: prom/prometheus:v3.1.0
+    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
     ports:
-      - 9090:9090
+      - 127.0.0.1:9090:9090
     command: --web.enable-otlp-receiver
-    extra_hosts:
-      - "host.docker.internal=host-gateway"
     configs:
       - source: prometheus_yaml
         target: /prometheus/prometheus.yml
   lakehouse-catalog:
-    image: ${LAKEKEEPER_IMAGE}
+    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4}
     environment:
       - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
       - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
       - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
-      - RUST_LOG=trace,axum=trace,sqlx=trace,iceberg-catalog=trace
+      - RUST_LOG=info
     command: ["serve"]
+    # The catalog opens a file per client connection and per database
+    # connection, and a test run can open more than the default limit of 1024.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     healthcheck:
       test: ["CMD", "/home/nonroot/iceberg-catalog", "healthcheck"]
       interval: 1s
@@ -113,10 +146,11 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    # etc/worktree-services.sh sets NISSHI_LAKEHOUSE_PORTS, so that Docker picks the host port.
     ports:
-      - "8181:8181"
+      - ${NISSHI_LAKEHOUSE_PORTS:-127.0.0.1:8181:8181}
   lakehouse-migrate:
-    image: ${LAKEKEEPER_IMAGE}
+    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4}
     environment:
       - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
       - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres

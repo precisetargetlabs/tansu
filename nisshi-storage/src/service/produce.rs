@@ -1,0 +1,405 @@
+// Copyright (c) Solace Corporation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+mod acks_zero;
+mod admission;
+mod batch_validation;
+mod deadline;
+mod detached;
+mod grouping;
+mod partition;
+mod rejection;
+mod request_validation;
+mod response;
+mod schema;
+mod slots;
+mod store;
+#[cfg(test)]
+mod tests;
+mod timestamps;
+mod topic;
+mod topic_configuration;
+mod unknown_partition;
+
+use std::{convert::Infallible, sync::Arc, time::Duration};
+
+use futures::{StreamExt as _, stream};
+use nisshi_sans_io::{
+    ApiKey, ErrorCode, ProduceRequest, ProduceResponse, produce_response::TopicProduceResponse,
+    record::inflated,
+};
+use nisshi_schema::Registry;
+use rama::{Layer as _, Service};
+use tokio::sync::Semaphore;
+use tracing::{debug, instrument};
+
+pub use self::{
+    acks_zero::{AcksZeroLayer, AcksZeroService},
+    admission::Admission,
+    batch_validation::{BatchValidationLayer, BatchValidationService},
+    detached::{StillRunning, wait_for_detached_writes},
+    partition::PartitionProduce,
+    request_validation::{
+        ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceTopic,
+        ValidatedProduceRequest, ValidatedTopic,
+    },
+    schema::{SchemaValidationLayer, SchemaValidationService},
+    store::StorePartitionService,
+    timestamps::{TimestampLayer, TimestampService},
+    topic::ProduceTopicService,
+    topic_configuration::TopicConfiguration,
+    unknown_partition::{UnknownPartitionLayer, UnknownPartitionService},
+};
+use self::{detached::Detached, slots::Slots};
+use crate::{
+    Error, Result, Storage,
+    decoded_budget::{self, DecodedBytesBudget},
+};
+
+/// How many partitions of one Produce request are written at once on a storage engine that does
+/// not set its own limit, see [`Storage::produce_concurrency`].
+///
+/// If a request writes its partitions one after another, a request for many partitions passes
+/// its deadline, and answers the partitions it did not reach with `REQUEST_TIMED_OUT`, however
+/// healthy each write is. Writing 4 at once takes a request for 100 partitions of 250 ms each
+/// from 25 s to about 6 s. The value is the one of `LIST_OFFSETS_CONCURRENCY`, for the same
+/// reasons. An engine with a connection pool bounds the calls of all requests itself, and the
+/// object store engine advances an idempotent producer's sequence with a compare-and-swap on one
+/// object, so each concurrent write to it costs conflict retries.
+///
+/// The decoded-byte budget counts each partition's batch while it is written, so a request holds
+/// up to this many batches of the budget at once, instead of one. The process-wide budget still
+/// caps the total. A partition that waits for the budget holds its slot, so the request makes no
+/// other storage call in that slot meanwhile.
+pub const PRODUCE_CONCURRENCY: usize = 4;
+
+/// Inflate a batch that a client sent in a Produce request, mapping a
+/// decode failure to `INVALID_RECORD`.
+///
+/// Accepts both a `deflated::Batch` and a `&deflated::Batch`. The two
+/// conversions take different decode paths and fail with different
+/// [`nisshi_sans_io::Error`] variants for the same bytes: by value, an
+/// uncompressed batch is parsed directly and a short record fails with
+/// `Overflow` or `TryGet`. By reference, every batch goes through the serde
+/// decoder and the same record fails with `Io(UnexpectedEof)`. Mapping every
+/// error keeps the client-visible code the same on every backend, whichever
+/// path it uses.
+///
+/// Every error is safe to treat as the client's fault, because decoding only
+/// reads bytes already in memory: decompression, varints, lengths and record
+/// fields all come from the request. Retrying the same bytes fails the same
+/// way, so the client needs `INVALID_RECORD` rather than
+/// `UNKNOWN_SERVER_ERROR`.
+///
+/// For a compressed batch this differs from Kafka on purpose. Kafka answers
+/// `INVALID_RECORD` for a truncated uncompressed record, but it wraps a
+/// decompression failure, including record data that is not a stream of the
+/// declared codec, in a `KafkaException`, and the client gets
+/// `UNKNOWN_SERVER_ERROR`. That code invites a retry of the same bytes, which
+/// cannot succeed. See [DefaultRecordBatch.java#L633-L641].
+///
+/// The decode error is logged at debug: [`ProduceService`] logs each
+/// rejection once, at warn, with the topic and partition, and a client can
+/// send any number of batches that do not decode.
+///
+/// A batch over the decoded-size limit keeps its
+/// [`nisshi_sans_io::Error::MessageMaxSizeExceeded`], so that
+/// [`ProduceService`] answers `MESSAGE_TOO_LARGE`, which a producer can
+/// recover from by splitting the batch.
+///
+/// Only use this on a batch from a client Produce request. A stored batch
+/// that fails to decode is a broker fault, and must keep its own error.
+///
+/// [DefaultRecordBatch.java#L633-L641]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L633-L641
+pub fn inflate_produced<B>(batch: B) -> Result<inflated::Batch>
+where
+    inflated::Batch: TryFrom<B, Error = nisshi_sans_io::Error>,
+{
+    inflated::Batch::try_from(batch).map_err(|err| match err {
+        nisshi_sans_io::Error::MessageMaxSizeExceeded(_) => Error::SansIo(err),
+        err => {
+            debug!(?err, "produce batch does not decode");
+            Error::Api(ErrorCode::InvalidRecord)
+        }
+    })
+}
+
+/// A [`Service`] taking [`ValidatedProduceRequest`] returning [`ProduceResponse`], that serves the
+/// topics of the request with `topics`, up to `concurrency` storage calls at once, and answers them
+/// in the order of the request.
+///
+/// [`ProduceService::new`] gives it a [`ProduceTopicService`] that uses a [`Storage`]. Call
+/// [`ProduceService::with_validation`] to get a service that takes a [`ProduceRequest`].
+/// ```no_run
+/// # #![recursion_limit = "256"]
+/// use bytes::Bytes;
+/// use rama::{Layer as _, Service as _};
+/// use nisshi_sans_io::{
+///     CreateTopicsRequest, ErrorCode, ProduceRequest,
+///     create_topics_request::CreatableTopic,
+///     produce_request::{PartitionProduceData, TopicProduceData},
+///     record::{Record, deflated::Frame, inflated},
+/// };
+/// use nisshi_storage::{CreateTopicsService, CreateTopicsValidationLayer, Error, ProduceService, StorageContainer};
+/// use url::Url;
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Error> {
+/// const CLUSTER_ID: &str = "nisshi";
+/// const NODE_ID: i32 = 111;
+/// const HOST: &str = "localhost";
+/// const PORT: i32 = 9092;
+///
+/// let storage = StorageContainer::builder()
+///     .cluster_id(CLUSTER_ID)
+///     .node_id(NODE_ID)
+///     .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
+///     .storage(Url::parse("memory://nisshi/")?)
+///     .build()
+///     .await?;
+///
+/// let create_topic = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
+///     storage: storage.clone(),
+/// });
+///
+/// let name = "abcba";
+///
+/// let response = create_topic
+///     .serve(
+///         CreateTopicsRequest::default()
+///             .topics(Some(vec![
+///                 CreatableTopic::default()
+///                     .name(name.into())
+///                     .num_partitions(5)
+///                     .replication_factor(3)
+///                     .assignments(Some([].into()))
+///                     .configs(Some([].into())),
+///             ]))
+///             .validate_only(Some(false)),
+///     )
+///     .await?;
+///
+/// let topics = response.topics.unwrap_or_default();
+/// assert_eq!(1, topics.len());
+/// assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+///
+/// let produce = ProduceService::new(storage.clone()).with_validation();
+///
+/// let partition = 0;
+///
+/// let response = produce
+///     .serve(
+///         ProduceRequest::default().topic_data(Some(
+///             [TopicProduceData::default()
+///                 .name(name.into())
+///                 .partition_data(Some(
+///                     [PartitionProduceData::default()
+///                         .index(partition)
+///                         .records(Some(Frame {
+///                             batches: vec![
+///                                 inflated::Batch::builder()
+///                                     .record(
+///                                         Record::builder().value(
+///                                             Bytes::from_static(
+///                                                 b"Lorem ipsum dolor sit amet",
+///                                             )
+///                                             .into(),
+///                                         ),
+///                                     )
+///                                     .build()
+///                                     .and_then(TryInto::try_into)?,
+///                             ],
+///                         }))]
+///                     .into(),
+///                 ))]
+///             .into(),
+///         )),
+///     )
+///     .await?;
+///
+/// let topics = response.responses.as_deref().unwrap_or_default();
+/// assert_eq!(1, topics.len());
+/// let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+/// assert_eq!(1, partitions.len());
+/// assert_eq!(
+///     ErrorCode::None,
+///     ErrorCode::try_from(partitions[0].error_code)?
+/// );
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct ProduceService<S> {
+    topics: S,
+    budget: Arc<DecodedBytesBudget>,
+    wait: Duration,
+    concurrency: usize,
+    shared: Option<Arc<Semaphore>>,
+}
+
+impl<S> ApiKey for ProduceService<S> {
+    const KEY: i16 = ProduceRequest::KEY;
+}
+
+/// The steps that [`ProduceService::new`] applies to each partition of a topic, in order: the
+/// batch checks, the timestamp validation, the schema validation, and the write to storage. The
+/// outermost step also answers a rejected batch for a partition that does not exist with
+/// `UNKNOWN_TOPIC_OR_PARTITION`.
+pub type StoredPartitions<G> = UnknownPartitionService<
+    G,
+    BatchValidationService<TimestampService<SchemaValidationService<StorePartitionService<G>>>>,
+>;
+
+impl<G> ProduceService<ProduceTopicService<G, StoredPartitions<G>>>
+where
+    G: Storage + Clone,
+{
+    /// Returns a service that validates the batches of a request, and stores them in `storage`.
+    /// The service does not validate them against a schema.
+    pub fn new(storage: G) -> Self {
+        Self::with_schemas(storage, None)
+    }
+
+    /// Returns a service like [`ProduceService::new`] that also validates each batch against the
+    /// schema of its topic in `schemas`, the registry that holds the schema of each topic, unless
+    /// the topic's `schema.validation` is `false`.
+    pub fn with_schemas(storage: G, schemas: Option<Registry>) -> Self {
+        Self::with_detached(storage, schemas, Detached::process())
+    }
+
+    /// Returns a service like [`ProduceService::with_schemas`] that tracks the writes that the
+    /// deadline leaves running in `detached`, not in the set of the process.
+    fn with_detached(storage: G, schemas: Option<Registry>, detached: Detached) -> Self {
+        let partitions = (
+            UnknownPartitionLayer::new(storage.clone()),
+            BatchValidationLayer::new(),
+            TimestampLayer::new(),
+            SchemaValidationLayer::new(schemas),
+        )
+            .into_layer(StorePartitionService::with_detached(
+                storage.clone(),
+                detached,
+            ));
+
+        // At least 1: `buffer_unordered(0)` never starts a future, so a request would hang.
+        let concurrency = storage.produce_concurrency().max(1);
+        let shared = storage.produce_permits();
+
+        Self {
+            shared,
+            ..Self::from_topics(ProduceTopicService::new(storage, partitions), concurrency)
+        }
+    }
+
+    /// Returns a service like [`ProduceService::new`] over `detached`, a set of its own.
+    #[cfg(test)]
+    fn new_sharing(storage: G, detached: Detached) -> Self {
+        Self::with_detached(storage, None, detached)
+    }
+}
+
+impl<S> ProduceService<S> {
+    /// Returns a service that serves each topic with `topics`, up to `concurrency` storage calls
+    /// of a request at once, and holds the decoded batches of a request against the process-wide
+    /// budget, for which a request waits at most [`decoded_budget::WAIT_TIMEOUT`]. A
+    /// `concurrency` below 1 counts as 1.
+    fn from_topics(topics: S, concurrency: usize) -> Self {
+        Self {
+            topics,
+            budget: decoded_budget::produce(),
+            wait: decoded_budget::WAIT_TIMEOUT,
+            concurrency: concurrency.max(1),
+            shared: None,
+        }
+    }
+
+    /// Returns this service holding the decoded batches of a request against `budget`, for which
+    /// a request waits at most `wait`.
+    #[cfg(test)]
+    pub(super) fn with_decoded_budget(
+        self,
+        budget: Arc<DecodedBytesBudget>,
+        wait: Duration,
+    ) -> Self {
+        Self {
+            budget,
+            wait,
+            ..self
+        }
+    }
+}
+
+impl<S> ProduceService<S>
+where
+    S: Service<ProduceTopic, Output = TopicProduceResponse, Error = Infallible>,
+{
+    /// Returns this service behind the layers that give it a [`ValidatedProduceRequest`] and that
+    /// close the connection of a failed `acks=0` request: [`AcksZeroLayer`] around
+    /// [`ProduceRequestValidationLayer`].
+    pub fn with_validation(
+        self,
+    ) -> AcksZeroService<ProduceRequestValidationService<ProduceService<S>>> {
+        AcksZeroLayer::new().layer(ProduceRequestValidationLayer::new().layer(self))
+    }
+}
+
+impl<S> Service<ValidatedProduceRequest> for ProduceService<S>
+where
+    S: Service<ProduceTopic, Output = TopicProduceResponse, Error = Infallible>,
+{
+    type Output = ProduceResponse;
+    type Error = Error;
+
+    #[instrument(skip(self, request))]
+    async fn serve(&self, request: ValidatedProduceRequest) -> Result<Self::Output, Self::Error> {
+        // One wait for the whole request, so that a request with many partitions does not wait
+        // the full time for each one.
+        let admission = Admission::new(Arc::clone(&self.budget), self.wait);
+
+        // One set of slots for the whole request, so that its topics together never make more
+        // than `concurrency` storage calls at once.
+        let slots = Slots::new(self.concurrency, self.shared.clone());
+
+        // If a request names a topic twice, the entries of that name are one group, and a group
+        // is served one entry after another, so the writes to a partition keep the request's
+        // order.
+        let groups = grouping::by_key(request.topics, |topic| topic.name.clone())
+            .into_iter()
+            .map(|group| async {
+                let mut answered = Vec::with_capacity(group.len());
+
+                for (position, topic) in group {
+                    let topic = ProduceTopic::new(topic, admission.clone(), slots.clone());
+
+                    let Ok(response) = self.topics.serve(topic).await;
+                    answered.push((position, response));
+                }
+
+                answered
+            })
+            .collect::<Vec<_>>();
+
+        // Unordered, because an ordered buffer keeps a finished group's answer behind an
+        // unfinished earlier one and counts it against the window, so one slow topic would hold
+        // the later ones back. The slots bound the storage calls.
+        let answered = stream::iter(groups)
+            .buffer_unordered(self.concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(response::produce_response(grouping::in_request_order(
+            answered,
+        )))
+    }
+}

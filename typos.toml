@@ -4,10 +4,15 @@ ignore-hidden = true
 extend-exclude = [
     # not our typos
     "license.html",
-    "tansu-sans-io/message",
+    "nisshi-sans-io/message",
+    # PEM fixtures: base64, not prose
+    "nisshi-cli/tests/fixtures/tls",
 ]
 
 [default]
+# A GitHub handle, which typos reads as a misspelling of "across". Matching only the handle
+# keeps the real typo caught everywhere else.
+extend-ignore-re = ["solace-aross"]
 
 [default.extend-words]
 ser = "ser"
