@@ -12,9 +12,8 @@ channels = ["conda-forge"]
 platforms = ["osx-arm64", "osx-64", "linux-64"]
 
 [dependencies]
-# Rust toolchain
-rust = ">=1.93"
-cargo = ">=1.93"
+# The conda-forge rust package includes cargo.
+rust = "1.98.*"
 
 # Build tools
 cmake = ">=3.28"
@@ -31,7 +30,6 @@ uv = ">=0.5"
 
 # Testing infrastructure
 docker-compose = ">=2.0"
-kubectl = ">=1.29"
 
 [feature.dev.dependencies]
 # Additional dev-only tools
@@ -50,7 +48,7 @@ test = "cargo test --workspace"
 fmt = "cargo fmt --all"
 lint = "cargo clippy --workspace --all-targets -- -D warnings"
 build = "cargo build --release"
-broker = "cargo run --release --bin tansu-broker"
+broker = "cargo run --release --bin nisshi -- broker"
 
 [tasks.up]
 description = "Start local development stack"

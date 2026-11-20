@@ -1,0 +1,94 @@
+[package]
+name = "nisshi-broker"
+description = "Nisshi Apache Kafka®-compatible broker"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["dynostore", "libsql", "postgres", "slatedb", "turso"]
+dynostore = ["dep:nisshi-storage-dynostore"]
+libsql = ["dep:nisshi-storage-sql", "nisshi-storage-sql/libsql"]
+postgres = ["dep:nisshi-storage-sql", "nisshi-storage-sql/postgres"]
+slatedb = ["dep:nisshi-storage-slatedb"]
+turso = ["dep:nisshi-storage-sql", "nisshi-storage-sql/turso"]
+
+# docs.rs builds with nightly, where `branches` 0.4 (a dependency of turso) no longer
+# compiles. Remove this table once turso depends on `branches` 0.5.
+# https://github.com/nisshi-io/solace-nisshi/issues/1045
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["dynostore", "libsql", "postgres", "slatedb"]
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+console.workspace = true
+futures.workspace = true
+glob.workspace = true
+http-body-util.workspace = true
+human-units.workspace = true
+humantime.workspace = true
+hyper-util.workspace = true
+hyper.workspace = true
+indicatif.workspace = true
+jsonschema.workspace = true
+libc.workspace = true
+nisshi-auth.workspace = true
+nisshi-model.workspace = true
+nisshi-otel.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-schema.workspace = true
+nisshi-service.workspace = true
+nisshi-storage-dynostore = { workspace = true, optional = true }
+nisshi-storage-null.workspace = true
+nisshi-storage-slatedb = { workspace = true, optional = true }
+nisshi-storage-sql = { workspace = true, optional = true }
+nisshi-storage.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+rama.workspace = true
+rand.workspace = true
+rsasl.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+crc-fast.workspace = true
+nisshi-schema.workspace = true
+nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
+nisshi-storage-sql = { workspace = true, features = ["test-support"] }
+nisshi-storage.workspace = true
+object_store.workspace = true
+pbkdf2.workspace = true
+pretty_assertions.workspace = true
+rcgen.workspace = true
+sha2.workspace = true
+slatedb.workspace = true
+snap.workspace = true
+tempfile.workspace = true
+tokio-postgres.workspace = true
+traceforge.workspace = true

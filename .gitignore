@@ -11,18 +11,36 @@
 .#*
 .*DS_Store
 .DS_Store
+.claude/worktrees/
 .env
 .vscode
 .zed
 Cargo.lock
+!/fuzz/Cargo.lock
 cargo-flamegraph.trace
+/dist
 debug
 dhat.*
+# `just kafka-ref`: a clone of Apache Kafka, or a symlink to one, and its partial clone
+/kafka-ref
+/kafka-ref.tmp
 flamegraph*.svg
 license.html
 perf.data*
 profile.json*
 target
+tmp
+
+# understand-anything: keep the committed graph, ignore its local scratch
+.ua/intermediate/
+.ua/diff-overlay.json
+.ua/.trash-*/
+fuzz/artifacts/fuzz_alter_user_scram_credentials_storage/
+/benchmark/openmessaging/.omb/
+/benchmark/openmessaging/results/
+/benchmark/openmessaging/broker.*
+/benchmark/openmessaging/.pg/
+/benchmark/openmessaging/run-*.log
 
 # Python
 __pycache__/

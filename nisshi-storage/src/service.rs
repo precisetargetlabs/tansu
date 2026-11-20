@@ -1,0 +1,2131 @@
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Or Hayat
+//   Shane Kennedy
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+mod alter_user_scram_credentials;
+mod consumer_group_describe;
+#[cfg(test)]
+mod counting_storage;
+mod create_acls;
+mod create_topics;
+mod delete_acls;
+mod delete_groups;
+mod delete_records;
+mod delete_topics;
+mod describe_acls;
+mod describe_cluster;
+mod describe_configs;
+mod describe_groups;
+mod describe_topic_partitions;
+mod describe_user_scram_credentials;
+mod fetch;
+mod find_coordinator;
+mod incremental_alter_configs;
+mod init_producer_id;
+mod list_groups;
+mod list_offsets;
+mod list_partition_reassignments;
+mod metadata;
+mod produce;
+#[cfg(test)]
+mod produce_all;
+#[cfg(test)]
+mod produce_budget;
+#[cfg(test)]
+mod produce_entry_points;
+pub mod read_deadline;
+pub mod read_share;
+mod txn;
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::{self, Debug, Display, Formatter},
+    sync::{Arc, LazyLock},
+    time::{Duration, SystemTime},
+};
+
+pub use alter_user_scram_credentials::AlterUserScramCredentialsService;
+use async_trait::async_trait;
+pub use consumer_group_describe::ConsumerGroupDescribeService;
+pub use create_acls::CreateAclsService;
+pub use create_topics::{
+    CreateTopicsService,
+    validation::{
+        CreateTopicsValidationLayer, CreateTopicsValidationService, MalformedCreateTopicsRequest,
+        ValidatedCreateTopicsRequest,
+    },
+};
+pub use delete_acls::DeleteAclsService;
+pub use delete_groups::DeleteGroupsService;
+pub use delete_records::{
+    DELETE_RECORDS_CONCURRENCY, DeleteRecordsConcurrency, DeleteRecordsService,
+};
+pub use delete_topics::DeleteTopicsService;
+pub use describe_acls::DescribeAclsService;
+pub use describe_cluster::DescribeClusterService;
+pub use describe_configs::DescribeConfigsService;
+pub use describe_groups::{DescribeGroupsService, describe_groups_response};
+pub use describe_topic_partitions::DescribeTopicPartitionsService;
+pub use describe_user_scram_credentials::DescribeUserScramCredentialsService;
+pub use fetch::{
+    FetchService,
+    validation::{
+        FetchValidationLayer, FetchValidationService, MalformedFetchRequest, ValidatedFetchRequest,
+    },
+};
+pub use find_coordinator::FindCoordinatorService;
+pub use incremental_alter_configs::IncrementalAlterConfigsService;
+pub use init_producer_id::InitProducerIdService;
+pub use list_groups::{ListGroupsService, list_groups_response};
+pub use list_offsets::{LIST_OFFSETS_CONCURRENCY, ListOffsetsService};
+pub use list_partition_reassignments::ListPartitionReassignmentsService;
+pub use metadata::{AutoCreateRefusals, KnownTopics, MetadataService};
+use nisshi_sans_io::{
+    ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
+    create_topics_request::CreatableTopic,
+    delete_groups_response::DeletableGroupResult,
+    delete_records_request::DeleteRecordsTopic,
+    delete_records_response::DeleteRecordsTopicResult,
+    describe_cluster_response::DescribeClusterBroker,
+    describe_configs_response::DescribeConfigsResult,
+    describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
+    fetch_response::AbortedTransaction,
+    incremental_alter_configs_request::AlterConfigsResource,
+    incremental_alter_configs_response::AlterConfigsResourceResponse,
+    record::{deflated, inflated},
+    txn_offset_commit_response::TxnOffsetCommitResponseTopic,
+};
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Gauge, Histogram},
+};
+pub use produce::{
+    AcksZeroLayer, AcksZeroService, Admission, BatchValidationLayer, BatchValidationService,
+    PRODUCE_CONCURRENCY, PartitionProduce, ProduceRequestValidationLayer,
+    ProduceRequestValidationService, ProduceService, ProduceTopic, ProduceTopicService,
+    SchemaValidationLayer, SchemaValidationService, StillRunning, StorePartitionService,
+    StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration, UnknownPartitionLayer,
+    UnknownPartitionService, ValidatedProduceRequest, ValidatedTopic, inflate_produced,
+    wait_for_detached_writes,
+};
+use rama::{Layer, Service};
+use tokio::{
+    sync::{
+        mpsc::{self, error::SendError},
+        oneshot,
+    },
+    time::Instant,
+};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, instrument, warn};
+pub use txn::add_offsets::AddOffsetsService as TxnAddOffsetsService;
+pub use txn::add_partitions::AddPartitionService as TxnAddPartitionService;
+pub use txn::end::EndService as TxnEndService;
+pub use txn::offset_commit::OffsetCommitService as TxnOffsetCommitService;
+use url::Url;
+use uuid::Uuid;
+
+use crate::{
+    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    RequestTimer, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
+    fetched::FetchedSender,
+    produce_path,
+    service::read_deadline::{QueueWait as _, ReadWait},
+};
+
+#[derive(Debug)]
+pub enum Request {
+    RegisterBroker(BrokerRegistrationRequest),
+    IncrementalAlterResource(AlterConfigsResource),
+    CreateTopic {
+        topic: CreatableTopic,
+        validate_only: bool,
+    },
+    DeleteRecords(Vec<DeleteRecordsTopic>),
+    DeleteTopic(TopicId),
+    Brokers,
+    Produce {
+        transaction_id: Option<String>,
+        topition: Topition,
+        batch: deflated::Batch,
+        /// `batch` decoded, when the caller has done that: see [`Storage::produce_inflated`].
+        inflated: Option<inflated::Batch>,
+    },
+    Fetch {
+        topition: Topition,
+        offset: i64,
+        min_bytes: u32,
+        max_bytes: u32,
+        isolation: IsolationLevel,
+        fetched_sender: FetchedSender,
+    },
+    OffsetStage(Topition),
+    CurrentOffsetStage(Topition),
+    ListOffsets {
+        isolation_level: IsolationLevel,
+        offsets: Vec<(Topition, ListOffset)>,
+    },
+    OffsetCommit {
+        group_id: String,
+        retention_time_ms: Option<Duration>,
+        offsets: Vec<(Topition, OffsetCommitRequest)>,
+    },
+    CommittedOffsetTopitions(String),
+    OffsetFetch {
+        group_id: Option<String>,
+        topics: Vec<Topition>,
+        require_stable: Option<bool>,
+    },
+    PendingTxnOffsets(String),
+    Metadata(Option<Vec<TopicId>>),
+    DescribeConfig {
+        name: String,
+        resource: ConfigResource,
+        keys: Option<Vec<String>>,
+    },
+    DescribeTopicPartitions {
+        topics: Option<Vec<TopicId>>,
+        partition_limit: i32,
+        cursor: Option<Topition>,
+    },
+    ListGroups,
+    DeleteGroups(Option<Vec<String>>),
+    DescribeGroups {
+        group_ids: Option<Vec<String>>,
+        include_authorized_operations: bool,
+    },
+    GroupWithVersion(String),
+    UpdateGroup {
+        group_id: String,
+        detail: GroupDetail,
+        version: Option<Version>,
+    },
+    InitProducer {
+        transaction_id: Option<String>,
+        transaction_timeout_ms: i32,
+        producer_id: Option<i64>,
+        producer_epoch: Option<i16>,
+    },
+    TxnAddOffsets {
+        transaction_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: String,
+    },
+    TxnAddPartitions(TxnAddPartitionsRequest),
+    TxnOffsetCommit(TxnOffsetCommitRequest),
+    TxnEnd {
+        transaction_id: String,
+        producer_id: i64,
+        producer_epoch: i16,
+        committed: bool,
+    },
+    Maintain(SystemTime),
+    MaintainTransactions(SystemTime),
+    AbortedTransactions {
+        topition: Topition,
+        offset: i64,
+        last_stable_offset: i64,
+    },
+    ClusterId,
+    Node,
+    AdvertisedListener,
+    DeleteUserScramCredential {
+        user: String,
+        mechanism: ScramMechanism,
+    },
+    UpsertUserScramCredential {
+        user: String,
+        mechanism: ScramMechanism,
+        credential: ScramCredential,
+    },
+    UserScramCredential {
+        user: String,
+        mechanism: ScramMechanism,
+    },
+    Ping,
+}
+
+impl Request {
+    /// Returns the [`Storage`] method that this request calls.
+    pub fn operation(&self) -> StorageOperation {
+        match self {
+            Self::AdvertisedListener => StorageOperation::AdvertisedListener,
+            Self::Brokers => StorageOperation::Brokers,
+            Self::ClusterId => StorageOperation::ClusterId,
+            Self::CommittedOffsetTopitions(_) => StorageOperation::CommittedOffsetTopitions,
+            Self::CreateTopic { .. } => StorageOperation::CreateTopic,
+            Self::DeleteGroups(_) => StorageOperation::DeleteGroups,
+            Self::DeleteRecords(_) => StorageOperation::DeleteRecords,
+            Self::DeleteTopic(_) => StorageOperation::DeleteTopic,
+            Self::DescribeConfig { .. } => StorageOperation::DescribeConfig,
+            Self::DescribeGroups { .. } => StorageOperation::DescribeGroups,
+            Self::DescribeTopicPartitions { .. } => StorageOperation::DescribeTopicPartitions,
+            Self::Fetch { .. } => StorageOperation::Fetch,
+            Self::GroupWithVersion(_) => StorageOperation::GroupWithVersion,
+            Self::IncrementalAlterResource(_) => StorageOperation::IncrementalAlterResource,
+            Self::InitProducer { .. } => StorageOperation::InitProducer,
+            Self::ListGroups => StorageOperation::ListGroups,
+            Self::ListOffsets { .. } => StorageOperation::ListOffsets,
+            Self::Maintain(_) => StorageOperation::Maintain,
+            Self::MaintainTransactions(_) => StorageOperation::MaintainTransactions,
+            Self::AbortedTransactions { .. } => StorageOperation::AbortedTransactions,
+            Self::Metadata(_) => StorageOperation::Metadata,
+            Self::Node => StorageOperation::Node,
+            Self::OffsetCommit { .. } => StorageOperation::OffsetCommit,
+            Self::OffsetFetch { .. } => StorageOperation::OffsetFetch,
+            Self::OffsetStage(_) => StorageOperation::OffsetStage,
+            Self::CurrentOffsetStage(_) => StorageOperation::CurrentOffsetStage,
+            Self::PendingTxnOffsets(_) => StorageOperation::PendingTxnOffsets,
+            Self::Produce { .. } => StorageOperation::Produce,
+            Self::RegisterBroker(_) => StorageOperation::RegisterBroker,
+            Self::TxnAddOffsets { .. } => StorageOperation::TxnAddOffsets,
+            Self::TxnAddPartitions(_) => StorageOperation::TxnAddPartitions,
+            Self::TxnEnd { .. } => StorageOperation::TxnEnd,
+            Self::TxnOffsetCommit(_) => StorageOperation::TxnOffsetCommit,
+            Self::UpdateGroup { .. } => StorageOperation::UpdateGroup,
+            Self::DeleteUserScramCredential { .. } => StorageOperation::DeleteUserScramCredential,
+            Self::UpsertUserScramCredential { .. } => StorageOperation::UpsertUserScramCredential,
+            Self::UserScramCredential { .. } => StorageOperation::UserScramCredential,
+            Self::Ping => StorageOperation::Ping,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Response {
+    AdvertisedListener(Result<Url>),
+    Brokers(Result<Vec<DescribeClusterBroker>>),
+    ClusterId(Result<String>),
+    CommittedOffsetTopitions(Result<BTreeMap<Topition, CommittedOffset>>),
+    CreateTopic(Result<Uuid>),
+    DeleteGroups(Result<Vec<DeletableGroupResult>>),
+    DeleteRecords(Result<Vec<DeleteRecordsTopicResult>>),
+    DeleteTopic(Result<ErrorCode>),
+    DeleteUserScramCredential(Result<()>),
+    DescribeConfig(Result<DescribeConfigsResult>),
+    DescribeGroups(Result<Vec<NamedGroupDetail>>),
+    DescribeTopicPartitions(Result<Vec<DescribeTopicPartitionsResponseTopic>>),
+    Fetch(Result<()>),
+    GroupWithVersion(Result<Option<(GroupDetail, Version)>>),
+    IncrementalAlterResponse(Result<AlterConfigsResourceResponse>),
+    InitProducer(Result<ProducerIdResponse>),
+    ListGroups(Result<Vec<NamedGroupDetail>>),
+    ListOffsets(Result<Vec<(Topition, ListOffsetResponse)>>),
+    Maintain(Result<()>),
+    MaintainTransactions(Result<()>),
+    AbortedTransactions(Result<Vec<AbortedTransaction>>),
+    Metadata(Result<MetadataResponse>),
+    Node(Result<i32>),
+    OffsetCommit(Result<Vec<(Topition, ErrorCode)>>),
+    OffsetFetch(Result<BTreeMap<Topition, CommittedOffset>>),
+    OffsetStage(Result<OffsetStage>),
+    CurrentOffsetStage(Result<OffsetStage>),
+    PendingTxnOffsets(Result<BTreeSet<Topition>>),
+    Ping(Result<()>),
+    Produce(Result<i64>),
+    RegisterBroker(Result<()>),
+    TxnAddOffsets(Result<ErrorCode>),
+    TxnAddPartitions(Result<TxnAddPartitionsResponse>),
+    TxnEnd(Result<ErrorCode>),
+    TxnOffsetCommit(Result<Vec<TxnOffsetCommitResponseTopic>>),
+    UpdateGroup(Result<Version, UpdateError<GroupDetail>>),
+    UpsertUserScramCredential(Result<()>),
+    UserScramCredential(Result<Option<ScramCredential>>),
+}
+
+/// Returns the error code that a partition answers when storage fails for
+/// it: [`Error::error_code`], with `KAFKA_STORAGE_ERROR` for an error that a
+/// retry may fix.
+///
+/// Kafka answers `KAFKA_STORAGE_ERROR` for a log that it cannot read, and
+/// `UNKNOWN_SERVER_ERROR` for an exception that it does not map to a code
+/// ([KafkaApis.scala#L1228-L1251]). A transient storage error, such as a
+/// database or object store that times out or is unavailable, is the first,
+/// and a client retries it after a metadata refresh. Any other error is the
+/// second: a retry does not fix it.
+///
+/// [KafkaApis.scala#L1228-L1251]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1228-L1251
+pub(crate) fn storage_error_code(error: &Error) -> ErrorCode {
+    error.error_code(ErrorCode::KafkaStorageError)
+}
+
+/// The sender of a request's outcome: the response, or the error that its storage task failed
+/// with. The error keeps its type, so [`Error::is_transient`] and [`Error::error_code`] give
+/// the same answer on both sides of the channel.
+pub type OutcomeSender = oneshot::Sender<Result<Response>>;
+
+/// A [`Request`] sent on the storage channel, with a sender for its outcome and a sender for
+/// the signal that its service started it.
+#[derive(Debug)]
+pub struct ChannelRequest {
+    pub request: Request,
+    /// Takes the outcome when the service has served the request.
+    pub response: OutcomeSender,
+    /// Takes a signal when the service starts to serve the request. The sender of the request
+    /// treats a dropped `started` as a start.
+    pub started: oneshot::Sender<()>,
+}
+
+pub type RequestSender = mpsc::Sender<ChannelRequest>;
+pub type RequestReceiver = mpsc::Receiver<ChannelRequest>;
+
+pub fn bounded_channel(buffer: usize) -> (RequestSender, RequestReceiver) {
+    mpsc::channel::<ChannelRequest>(buffer)
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum ServiceError {
+    Storage(Error),
+    UpdateGroupDetail(UpdateError<GroupDetail>),
+}
+
+impl Display for ServiceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl From<SendError<()>> for ServiceError {
+    fn from(_value: SendError<()>) -> Self {
+        Self::Storage(Error::UnableToSend)
+    }
+}
+
+impl From<Error> for ServiceError {
+    fn from(value: Error) -> Self {
+        Self::Storage(value)
+    }
+}
+
+impl From<UpdateError<GroupDetail>> for ServiceError {
+    fn from(value: UpdateError<GroupDetail>) -> Self {
+        Self::UpdateGroupDetail(value)
+    }
+}
+
+impl From<ServiceError> for Error {
+    fn from(value: ServiceError) -> Self {
+        if let ServiceError::Storage(error) = value {
+            error
+        } else {
+            unreachable!()
+        }
+    }
+}
+
+impl From<ServiceError> for UpdateError<GroupDetail> {
+    fn from(value: ServiceError) -> Self {
+        if let ServiceError::UpdateGroupDetail(error) = value {
+            error
+        } else {
+            unreachable!()
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RequestLayer;
+
+impl<S> Layer<S> for RequestLayer {
+    type Service = RequestService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Self::Service { inner }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RequestService<S> {
+    inner: S,
+}
+
+impl<S> Service<Request> for RequestService<S>
+where
+    S: Service<Request>,
+{
+    type Output = S::Output;
+    type Error = S::Error;
+
+    async fn serve(&self, input: Request) -> Result<Self::Output, Self::Error> {
+        debug!(?input);
+        self.inner.serve(input).await
+    }
+}
+
+/// A [`Service`] sending [`Request`]s over a [`RequestSender`] channel
+#[derive(Clone, Debug)]
+pub struct RequestChannelService {
+    tx: RequestSender,
+}
+
+impl RequestChannelService {
+    pub fn new(tx: RequestSender) -> Self {
+        Self { tx }
+    }
+
+    /// Sends `input` on the channel once the channel has room for it.
+    ///
+    /// A produce does not go through this or `serve`: `produce_batch` reserves its own slot.
+    async fn send(&self, input: Request) -> Result<SentRequest, ServiceError> {
+        let start = Instant::now();
+
+        let operation = input.operation();
+        self.record_capacity(operation);
+
+        let permit = self.reserve(operation).await?;
+
+        Ok(Self::send_reserved(permit, input, start))
+    }
+
+    /// Records the free slots of the channel, for a request of `operation` that is about to take
+    /// one.
+    fn record_capacity(&self, operation: StorageOperation) {
+        let capacity = self.tx.capacity();
+        STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &[operation.attribute()]);
+        debug!(%operation, capacity);
+    }
+
+    /// Reserves a slot in the channel for a request of `operation`, and waits until the channel
+    /// has room for it.
+    async fn reserve(
+        &self,
+        operation: StorageOperation,
+    ) -> Result<mpsc::Permit<'_, ChannelRequest>, ServiceError> {
+        self.tx
+            .reserve()
+            .queued_for(ReadWait::ExclusiveEngineAccess)
+            .await
+            .inspect_err(|err| {
+                error!(%operation, ?err);
+                STORAGE_CHANNEL_ERROR.add(1, &[operation.attribute()]);
+            })
+            .map_err(Into::into)
+    }
+
+    /// Sends a produce of `deflated` on the channel, and waits for its response. Both produce
+    /// methods call this, so that each produce takes its slot, records the channel's capacity and
+    /// opens its span in one place.
+    ///
+    /// A produce that has to wait for a slot drops `inflated` before it waits, so the number of
+    /// decoded batches that the channel holds is the number of slots, not the number of waiting
+    /// produces. The storage then decodes the waiting produce's batch again.
+    #[instrument(name = "produce", skip_all)]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        let start = Instant::now();
+
+        let operation = StorageOperation::Produce;
+        self.record_capacity(operation);
+
+        let (permit, inflated) = match inflated {
+            Some(inflated) => match self.tx.try_reserve() {
+                Ok(permit) => {
+                    produce_path::direct(produce_path::Stage::Channel);
+                    (permit, Some(inflated))
+                }
+
+                Err(_) => {
+                    drop(inflated);
+                    produce_path::fallback(produce_path::Stage::Channel);
+                    (self.reserve(operation).await?, None)
+                }
+            },
+
+            None => (self.reserve(operation).await?, None),
+        };
+
+        let request = Request::Produce {
+            transaction_id: transaction_id.map(str::to_owned),
+            topition: topition.to_owned(),
+            batch: deflated,
+            inflated,
+        };
+
+        Self::send_reserved(permit, request, start)
+            .response()
+            .await
+            .and_then(|response| {
+                if let Response::Produce(inner) = response {
+                    inner.map_err(Into::into)
+                } else {
+                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
+                }
+            })
+            .map_err(Into::into)
+    }
+
+    /// Sends `input` through `permit`, which reserved a slot in the channel at `start`.
+    fn send_reserved(
+        permit: mpsc::Permit<'_, ChannelRequest>,
+        input: Request,
+        start: Instant,
+    ) -> SentRequest {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+
+        let operation = input.operation();
+        let attributes = [operation.attribute()];
+
+        permit.send(ChannelRequest {
+            request: input,
+            response: resp_tx,
+            started: started_tx,
+        });
+
+        let permit_elapsed = start.elapsed().as_millis() as u64;
+        STORAGE_CHANNEL_PERMIT_DURATION.record(permit_elapsed, &attributes);
+        debug!(%operation, permit_elapsed);
+
+        SentRequest {
+            response: resp_rx,
+            started: started_rx,
+            timer: RequestTimer::new(&STORAGE_CHANNEL_REQUEST_DURATION, operation, start),
+            operation,
+        }
+    }
+}
+
+/// A [`Request`] that [`RequestChannelService`] has sent on its channel, waiting for its
+/// [`Response`].
+struct SentRequest {
+    response: oneshot::Receiver<Result<Response>>,
+    started: oneshot::Receiver<()>,
+    timer: RequestTimer,
+    operation: StorageOperation,
+}
+
+impl SentRequest {
+    async fn response(self) -> Result<Response, ServiceError> {
+        let operation = self.operation;
+        let attributes = [operation.attribute()];
+
+        let response = self
+            .response
+            .await
+            .map_err(|_| Error::OneshotRecv)
+            .and_then(|outcome| outcome)
+            .map_err(ServiceError::from)
+            .inspect(|_| debug!(%operation))
+            .inspect_err(|err| {
+                error!(%operation, ?err);
+                STORAGE_CHANNEL_ERROR.add(1, &attributes);
+            });
+
+        self.timer.end(&response);
+        response
+    }
+}
+
+static STORAGE_CHANNEL_CAPACITY: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("nisshi_storage_channel_capacity")
+        .with_description("Storage channel capacity")
+        .build()
+});
+
+impl Service<Request> for RequestChannelService {
+    type Output = Response;
+    type Error = ServiceError;
+
+    #[instrument(skip_all)]
+    async fn serve(&self, input: Request) -> Result<Self::Output, Self::Error> {
+        self.send(input).await?.response().await
+    }
+}
+
+static STORAGE_CHANNEL_REQUEST_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("nisshi_storage_channel_request_duration")
+        .with_unit("ms")
+        .with_description(
+            "Storage channel request latency in milliseconds. outcome=stopped counts a request \
+             that its caller dropped, such as a fetch at its deadline.",
+        )
+        .build()
+});
+
+static STORAGE_CHANNEL_PERMIT_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("nisshi_storage_channel_permit_duration")
+        .with_unit("ms")
+        .with_description("Storage channel permit latency in milliseconds")
+        .build()
+});
+
+static STORAGE_CHANNEL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_storage_channel_error")
+        .with_description("Storage channel error count")
+        .build()
+});
+
+/// Sends `$request` to the storage channel and extracts the `Response::$variant` payload,
+/// erroring if the channel responded with an unexpected variant.
+macro_rules! serve_and_extract {
+    ($self:ident, $request:expr, $variant:ident) => {
+        $self
+            .serve($request)
+            .await
+            .and_then(|response| {
+                if let Response::$variant(inner) = response {
+                    inner.map_err(Into::into)
+                } else {
+                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
+                }
+            })
+            .map_err(Into::into)
+    };
+}
+
+#[async_trait]
+impl Storage for RequestChannelService {
+    #[instrument(skip_all)]
+    async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
+        serve_and_extract!(
+            self,
+            Request::RegisterBroker(broker_registration),
+            RegisterBroker
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn incremental_alter_resource(
+        &self,
+        resource: AlterConfigsResource,
+    ) -> Result<AlterConfigsResourceResponse> {
+        serve_and_extract!(
+            self,
+            Request::IncrementalAlterResource(resource),
+            IncrementalAlterResponse
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
+        serve_and_extract!(
+            self,
+            Request::CreateTopic {
+                topic,
+                validate_only,
+            },
+            CreateTopic
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_records(
+        &self,
+        topics: &[DeleteRecordsTopic],
+    ) -> Result<Vec<DeleteRecordsTopicResult>> {
+        serve_and_extract!(
+            self,
+            Request::DeleteRecords(Vec::from(topics)),
+            DeleteRecords
+        )
+    }
+
+    /// The server of a channel serves one request after another, see
+    /// [`ChannelRequestService`], so a second call waits for the first.
+    /// This answers without a request over the channel, which a call could
+    /// not make before the deadline check.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::serial()
+    }
+
+    /// One write at a time, for the reason [`Storage::delete_records_concurrency`] gives above.
+    fn produce_concurrency(&self) -> usize {
+        1
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
+        serve_and_extract!(self, Request::DeleteTopic(topic.to_owned()), DeleteTopic)
+    }
+
+    #[instrument(skip_all)]
+    async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
+        serve_and_extract!(self, Request::Brokers, Brokers)
+    }
+
+    async fn produce(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        batch: deflated::Batch,
+    ) -> Result<i64> {
+        self.produce_batch(transaction_id, topition, batch, None)
+            .await
+    }
+
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
+            .await
+    }
+
+    #[instrument(skip_all)]
+    async fn fetch(
+        &self,
+        topition: &'_ Topition,
+        offset: i64,
+        min_bytes: u32,
+        max_bytes: u32,
+        isolation: IsolationLevel,
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
+        let request = Request::Fetch {
+            topition: topition.to_owned(),
+            offset,
+            min_bytes,
+            max_bytes,
+            isolation,
+            fetched_sender,
+        };
+
+        let mut sent = self.send(request).await?;
+
+        // Wait for the service to start the read, which may be queued behind other requests.
+        // The service drops `started` if it skips the read, so ignore the result.
+        _ = (&mut sent.started)
+            .queued_for(ReadWait::ExclusiveEngineAccess)
+            .await;
+
+        // The read on the other end of the channel sends its items to the caller directly, so the
+        // response only says how the read ended.
+        match sent.response().await? {
+            Response::Fetch(fetched) => fetched,
+            response => Err(Error::UnexpectedServiceResponse(Box::new(response))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        serve_and_extract!(self, Request::OffsetStage(topition.to_owned()), OffsetStage)
+    }
+
+    #[instrument(skip_all)]
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        serve_and_extract!(
+            self,
+            Request::CurrentOffsetStage(topition.to_owned()),
+            CurrentOffsetStage
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn list_offsets(
+        &self,
+        isolation_level: IsolationLevel,
+        offsets: &[(Topition, ListOffset)],
+    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+        let offsets = Vec::from(offsets);
+
+        serve_and_extract!(
+            self,
+            Request::ListOffsets {
+                isolation_level,
+                offsets,
+            },
+            ListOffsets
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn offset_commit(
+        &self,
+        group_id: &str,
+        retention_time_ms: Option<Duration>,
+        offsets: &[(Topition, OffsetCommitRequest)],
+    ) -> Result<Vec<(Topition, ErrorCode)>> {
+        let group_id = group_id.to_string();
+        let offsets = Vec::from(offsets);
+
+        serve_and_extract!(
+            self,
+            Request::OffsetCommit {
+                group_id,
+                retention_time_ms,
+                offsets,
+            },
+            OffsetCommit
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
+        let group_id = group_id.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::CommittedOffsetTopitions(group_id),
+            CommittedOffsetTopitions
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn offset_fetch(
+        &self,
+        group_id: Option<&str>,
+        topics: &[Topition],
+        require_stable: Option<bool>,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
+        let group_id = group_id.map(|s| s.to_string());
+        let topics = Vec::from(topics);
+
+        serve_and_extract!(
+            self,
+            Request::OffsetFetch {
+                group_id,
+                topics,
+                require_stable,
+            },
+            OffsetFetch
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        let group_id = group_id.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::PendingTxnOffsets(group_id),
+            PendingTxnOffsets
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+        let topics = topics.map(Vec::from);
+
+        serve_and_extract!(self, Request::Metadata(topics), Metadata)
+    }
+
+    #[instrument(skip_all)]
+    async fn describe_config(
+        &self,
+        name: &str,
+        resource: ConfigResource,
+        keys: Option<&[String]>,
+    ) -> Result<DescribeConfigsResult> {
+        let name = name.to_string();
+        let keys = keys.map(Vec::from);
+
+        serve_and_extract!(
+            self,
+            Request::DescribeConfig {
+                name,
+                resource,
+                keys,
+            },
+            DescribeConfig
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn describe_topic_partitions(
+        &self,
+        topics: Option<&[TopicId]>,
+        partition_limit: i32,
+        cursor: Option<Topition>,
+    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
+        let topics = topics.map(Vec::from);
+
+        serve_and_extract!(
+            self,
+            Request::DescribeTopicPartitions {
+                topics,
+                partition_limit,
+                cursor,
+            },
+            DescribeTopicPartitions
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
+        serve_and_extract!(self, Request::ListGroups, ListGroups)
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_groups(
+        &self,
+        group_ids: Option<&[String]>,
+    ) -> Result<Vec<DeletableGroupResult>> {
+        let group_ids = group_ids.map(Vec::from);
+
+        serve_and_extract!(self, Request::DeleteGroups(group_ids), DeleteGroups)
+    }
+
+    #[instrument(skip_all)]
+    async fn describe_groups(
+        &self,
+        group_ids: Option<&[String]>,
+        include_authorized_operations: bool,
+    ) -> Result<Vec<NamedGroupDetail>> {
+        let group_ids = group_ids.map(Vec::from);
+
+        serve_and_extract!(
+            self,
+            Request::DescribeGroups {
+                group_ids,
+                include_authorized_operations,
+            },
+            DescribeGroups
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn group_with_version(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        serve_and_extract!(
+            self,
+            Request::GroupWithVersion(group_id.to_owned()),
+            GroupWithVersion
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn update_group(
+        &self,
+        group_id: &str,
+        detail: GroupDetail,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<GroupDetail>> {
+        let group_id = group_id.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::UpdateGroup {
+                group_id,
+                detail,
+                version,
+            },
+            UpdateGroup
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn init_producer(
+        &self,
+        transaction_id: Option<&str>,
+        transaction_timeout_ms: i32,
+        producer_id: Option<i64>,
+        producer_epoch: Option<i16>,
+    ) -> Result<ProducerIdResponse> {
+        let transaction_id = transaction_id.map(|transaction_id| transaction_id.to_owned());
+
+        serve_and_extract!(
+            self,
+            Request::InitProducer {
+                transaction_id,
+                transaction_timeout_ms,
+                producer_id,
+                producer_epoch,
+            },
+            InitProducer
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn txn_add_offsets(
+        &self,
+        transaction_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: &str,
+    ) -> Result<ErrorCode> {
+        let transaction_id = transaction_id.to_string();
+        let group_id = group_id.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::TxnAddOffsets {
+                transaction_id,
+                producer_id,
+                producer_epoch,
+                group_id,
+            },
+            TxnAddOffsets
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn txn_add_partitions(
+        &self,
+        partitions: TxnAddPartitionsRequest,
+    ) -> Result<TxnAddPartitionsResponse> {
+        serve_and_extract!(
+            self,
+            Request::TxnAddPartitions(partitions),
+            TxnAddPartitions
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn txn_offset_commit(
+        &self,
+        offsets: TxnOffsetCommitRequest,
+    ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
+        serve_and_extract!(self, Request::TxnOffsetCommit(offsets), TxnOffsetCommit)
+    }
+
+    #[instrument(skip_all)]
+    async fn txn_end(
+        &self,
+        transaction_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        committed: bool,
+    ) -> Result<ErrorCode> {
+        let transaction_id = transaction_id.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::TxnEnd {
+                transaction_id,
+                producer_id,
+                producer_epoch,
+                committed,
+            },
+            TxnEnd
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn maintain(&self, now: SystemTime) -> Result<()> {
+        serve_and_extract!(self, Request::Maintain(now), Maintain)
+    }
+
+    #[instrument(skip_all)]
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        serve_and_extract!(
+            self,
+            Request::MaintainTransactions(now),
+            MaintainTransactions
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn aborted_transactions(
+        &self,
+        topition: &Topition,
+        offset: i64,
+        last_stable_offset: i64,
+    ) -> Result<Vec<AbortedTransaction>> {
+        serve_and_extract!(
+            self,
+            Request::AbortedTransactions {
+                topition: topition.clone(),
+                offset,
+                last_stable_offset,
+            },
+            AbortedTransactions
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn cluster_id(&self) -> Result<String> {
+        serve_and_extract!(self, Request::ClusterId, ClusterId)
+    }
+
+    #[instrument(skip_all)]
+    async fn node(&self) -> Result<i32> {
+        serve_and_extract!(self, Request::Node, Node)
+    }
+
+    #[instrument(skip_all)]
+    async fn advertised_listener(&self) -> Result<Url> {
+        serve_and_extract!(self, Request::AdvertisedListener, AdvertisedListener)
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_user_scram_credential(
+        &self,
+        user: &str,
+        mechanism: ScramMechanism,
+    ) -> Result<()> {
+        let user = user.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::DeleteUserScramCredential { user, mechanism },
+            DeleteUserScramCredential
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn upsert_user_scram_credential(
+        &self,
+        user: &str,
+        mechanism: ScramMechanism,
+        credential: ScramCredential,
+    ) -> Result<()> {
+        let user = user.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::UpsertUserScramCredential {
+                user,
+                mechanism,
+                credential,
+            },
+            UpsertUserScramCredential
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn user_scram_credential(
+        &self,
+        user: &str,
+        mechanism: ScramMechanism,
+    ) -> Result<Option<ScramCredential>> {
+        let user = user.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::UserScramCredential { user, mechanism },
+            UserScramCredential
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn ping(&self) -> Result<()> {
+        serve_and_extract!(self, Request::Ping, Ping)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChannelRequestLayer {
+    cancellation: CancellationToken,
+}
+
+impl ChannelRequestLayer {
+    pub fn new(cancellation: CancellationToken) -> Self {
+        Self { cancellation }
+    }
+}
+
+impl<S> Layer<S> for ChannelRequestLayer {
+    type Service = ChannelRequestService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Self::Service {
+            inner,
+            cancellation: self.cancellation.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChannelRequestService<S> {
+    inner: S,
+    cancellation: CancellationToken,
+}
+
+static STORAGE_CHANNEL_SERVER_FAILURE: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_storage_channel_server_failure")
+        .with_description(
+            "Count of per-request storage task failures in the mpsc server loop, by kind: a \
+             panic, a task cancelled at runtime shutdown, or a storage error; the loop itself \
+             continues serving other requests in every case",
+        )
+        .build()
+});
+
+static STORAGE_CHANNEL_RESPONSE_DISCARDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_storage_channel_response_discarded")
+        .with_description(
+            "Count of mpsc storage responses discarded because the requester dropped its \
+             response receiver (a client disconnect or a read deadline); normal client churn",
+        )
+        .build()
+});
+
+impl<S> Service<RequestReceiver> for ChannelRequestService<S>
+where
+    S: Service<Request, Output = Response, Error = Error> + Clone,
+{
+    type Output = ();
+    type Error = Error;
+
+    /// Runs the mpsc-mode storage supervisor loop.
+    ///
+    /// Each request's storage work runs in its own `tokio::spawn`'d task so that a panic
+    /// there is caught by Tokio's own per-task unwind handling (surfaced as
+    /// `JoinError::is_panic`) instead of unwinding this loop and ending storage for every
+    /// other caller sharing this channel. `spawn` is immediately followed by `.await` on
+    /// the resulting `JoinHandle`, which keeps request processing strictly sequential:
+    /// mpsc mode's single-writer discipline against the underlying SQLite connection
+    /// depends on staying sequential here, so this must not become fire-and-forget.
+    ///
+    /// Note that aborting this task (e.g. by dropping a `JoinSet` that owns it) only
+    /// cancels whichever child `JoinHandle` it happens to be awaiting at that moment; the
+    /// child keeps running detached to completion. That is harmless for correctness (its
+    /// `tx` is simply dropped, and the pooled connection still returns to the pool
+    /// normally through the child's own unwind/return path), but abort is not transitive.
+    async fn serve(&self, mut req: RequestReceiver) -> Result<Self::Output, Self::Error> {
+        loop {
+            tokio::select! {
+                received = req.recv() => {
+                    let Some(ChannelRequest { request, response: tx, started }) = received else {
+                        debug!("storage channel closed; ending supervisor loop");
+                        break;
+                    };
+
+                    // A fetch whose requester has stopped reading is answered with no batches
+                    // instead of being served. The requester stops reading at the read's deadline,
+                    // or when its client goes away, so serving the fetch would only delay the
+                    // requests queued behind it.
+                    if let Request::Fetch { fetched_sender, .. } = &request
+                        && fetched_sender.reader_has_stopped()
+                    {
+                        _ = tx.send(Ok(Response::Fetch(Ok(()))));
+                        continue;
+                    }
+
+                    // The requester may have stopped waiting for the start already.
+                    _ = started.send(());
+
+                    let operation = request.operation();
+                    let inner = self.inner.clone();
+
+                    match tokio::spawn(async move { inner.serve(request).await }).await {
+                        Ok(Ok(response)) => {
+                            if tx.send(Ok(response)).is_err() {
+                                debug!(
+                                    %operation,
+                                    "requester dropped its response receiver; discarding response"
+                                );
+
+                                STORAGE_CHANNEL_RESPONSE_DISCARDED
+                                    .add(1, &[operation.attribute()]);
+                            }
+                        }
+
+                        Ok(Err(error)) => {
+                            error!(%operation, ?error, "storage request failed");
+
+                            STORAGE_CHANNEL_SERVER_FAILURE.add(
+                                1,
+                                &[
+                                    operation.attribute(),
+                                    KeyValue::new("kind", "error"),
+                                ],
+                            );
+
+                            // The requester may have dropped its receiver, and the error is
+                            // already logged and counted.
+                            _ = tx.send(Err(error));
+                        }
+
+                        Err(join_error) => {
+                            let kind = if join_error.is_panic() {
+                                error!(
+                                    %operation,
+                                    ?join_error,
+                                    "storage request task panicked; isolated, loop continues"
+                                );
+                                "panic"
+                            } else {
+                                warn!(
+                                    %operation,
+                                    ?join_error,
+                                    "storage request task cancelled"
+                                );
+                                "cancelled"
+                            };
+
+                            STORAGE_CHANNEL_SERVER_FAILURE.add(
+                                1,
+                                &[
+                                    operation.attribute(),
+                                    KeyValue::new("kind", kind),
+                                ],
+                            );
+
+                            _ = tx.send(Err(Error::Join(Arc::new(join_error))));
+                        }
+                    }
+                }
+
+                cancelled = self.cancellation.cancelled() => {
+                    debug!(?cancelled);
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RequestStorageService<G> {
+    storage: G,
+}
+
+impl<G> RequestStorageService<G>
+where
+    G: Storage,
+{
+    pub fn new(storage: G) -> Self {
+        Self { storage }
+    }
+}
+
+impl<G> Service<Request> for RequestStorageService<G>
+where
+    G: Storage,
+{
+    type Output = Response;
+    type Error = Error;
+
+    async fn serve(&self, req: Request) -> Result<Self::Output, Self::Error> {
+        match req {
+            Request::RegisterBroker(broker_registration) => Ok(Response::RegisterBroker(
+                self.storage.register_broker(broker_registration).await,
+            )),
+            Request::IncrementalAlterResource(alter_configs_resource) => {
+                Ok(Response::IncrementalAlterResponse(
+                    self.storage
+                        .incremental_alter_resource(alter_configs_resource)
+                        .await,
+                ))
+            }
+            Request::CreateTopic {
+                topic,
+                validate_only,
+            } => Ok(Response::CreateTopic(
+                self.storage.create_topic(topic, validate_only).await,
+            )),
+            Request::DeleteRecords(delete_records_topics) => Ok(Response::DeleteRecords(
+                self.storage
+                    .delete_records(&delete_records_topics[..])
+                    .await,
+            )),
+            Request::DeleteTopic(topic_id) => Ok(Response::DeleteTopic(
+                self.storage.delete_topic(&topic_id).await,
+            )),
+            Request::Brokers => Ok(Response::Brokers(self.storage.brokers().await)),
+            Request::Produce {
+                transaction_id,
+                topition,
+                batch,
+                inflated,
+            } => Ok(Response::Produce(match inflated {
+                Some(inflated) => {
+                    self.storage
+                        .produce_inflated(transaction_id.as_deref(), &topition, batch, inflated)
+                        .await
+                }
+                None => {
+                    self.storage
+                        .produce(transaction_id.as_deref(), &topition, batch)
+                        .await
+                }
+            })),
+            Request::Fetch {
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            } => {
+                // A read behind the channel runs on a task of its own, so dropping the requester
+                // doesn't drop it. The read ends when its requester stops reading instead, as it
+                // would if the requester had dropped it.
+                let reader_stopped = fetched_sender.reader_stopped();
+
+                Ok(Response::Fetch(tokio::select! {
+                    biased;
+                    fetched = self.storage.fetch(
+                        &topition, offset, min_bytes, max_bytes, isolation, fetched_sender,
+                    ) => fetched,
+                    () = reader_stopped => Ok(()),
+                }))
+            }
+            Request::OffsetStage(topition) => Ok(Response::OffsetStage(
+                self.storage.offset_stage(&topition).await,
+            )),
+            Request::CurrentOffsetStage(topition) => Ok(Response::CurrentOffsetStage(
+                self.storage.current_offset_stage(&topition).await,
+            )),
+            Request::ListOffsets {
+                isolation_level,
+                offsets,
+            } => Ok(Response::ListOffsets(
+                self.storage
+                    .list_offsets(isolation_level, &offsets[..])
+                    .await,
+            )),
+            Request::OffsetCommit {
+                group_id,
+                retention_time_ms,
+                offsets,
+            } => Ok(Response::OffsetCommit(
+                self.storage
+                    .offset_commit(&group_id, retention_time_ms, &offsets[..])
+                    .await,
+            )),
+            Request::CommittedOffsetTopitions(group_id) => Ok(Response::CommittedOffsetTopitions(
+                self.storage.committed_offset_topitions(&group_id).await,
+            )),
+            Request::OffsetFetch {
+                group_id,
+                topics,
+                require_stable,
+            } => Ok(Response::OffsetFetch(
+                self.storage
+                    .offset_fetch(group_id.as_deref(), &topics[..], require_stable)
+                    .await,
+            )),
+            Request::PendingTxnOffsets(group_id) => Ok(Response::PendingTxnOffsets(
+                self.storage.pending_txn_offsets(&group_id).await,
+            )),
+            Request::Metadata(topic_ids) => Ok(Response::Metadata(
+                self.storage.metadata(topic_ids.as_deref()).await,
+            )),
+            Request::DescribeConfig {
+                name,
+                resource,
+                keys,
+            } => Ok(Response::DescribeConfig(
+                self.storage
+                    .describe_config(&name, resource, keys.as_deref())
+                    .await,
+            )),
+            Request::DescribeTopicPartitions {
+                topics,
+                partition_limit,
+                cursor,
+            } => Ok(Response::DescribeTopicPartitions(
+                self.storage
+                    .describe_topic_partitions(topics.as_deref(), partition_limit, cursor)
+                    .await,
+            )),
+            Request::ListGroups => Ok(Response::ListGroups(self.storage.list_groups().await)),
+            Request::DeleteGroups(items) => Ok(Response::DeleteGroups(
+                self.storage.delete_groups(items.as_deref()).await,
+            )),
+            Request::DescribeGroups {
+                group_ids,
+                include_authorized_operations,
+            } => Ok(Response::DescribeGroups(
+                self.storage
+                    .describe_groups(group_ids.as_deref(), include_authorized_operations)
+                    .await,
+            )),
+            Request::GroupWithVersion(group_id) => Ok(Response::GroupWithVersion(
+                self.storage.group_with_version(&group_id).await,
+            )),
+            Request::UpdateGroup {
+                group_id,
+                detail,
+                version,
+            } => Ok(Response::UpdateGroup(
+                self.storage.update_group(&group_id, detail, version).await,
+            )),
+            Request::InitProducer {
+                transaction_id,
+                transaction_timeout_ms,
+                producer_id,
+                producer_epoch,
+            } => Ok(Response::InitProducer(
+                self.storage
+                    .init_producer(
+                        transaction_id.as_deref(),
+                        transaction_timeout_ms,
+                        producer_id,
+                        producer_epoch,
+                    )
+                    .await,
+            )),
+            Request::TxnAddOffsets {
+                transaction_id,
+                producer_id,
+                producer_epoch,
+                group_id,
+            } => Ok(Response::TxnAddOffsets(
+                self.storage
+                    .txn_add_offsets(&transaction_id, producer_id, producer_epoch, &group_id)
+                    .await,
+            )),
+            Request::TxnAddPartitions(txn_add_partitions_request) => {
+                Ok(Response::TxnAddPartitions(
+                    self.storage
+                        .txn_add_partitions(txn_add_partitions_request)
+                        .await,
+                ))
+            }
+            Request::TxnOffsetCommit(txn_offset_commit_request) => Ok(Response::TxnOffsetCommit(
+                self.storage
+                    .txn_offset_commit(txn_offset_commit_request)
+                    .await,
+            )),
+            Request::TxnEnd {
+                transaction_id,
+                producer_id,
+                producer_epoch,
+                committed,
+            } => Ok(Response::TxnEnd(
+                self.storage
+                    .txn_end(&transaction_id, producer_id, producer_epoch, committed)
+                    .await,
+            )),
+            Request::Maintain(now) => Ok(Response::Maintain(self.storage.maintain(now).await)),
+            Request::MaintainTransactions(now) => Ok(Response::MaintainTransactions(
+                self.storage.maintain_transactions(now).await,
+            )),
+            Request::AbortedTransactions {
+                topition,
+                offset,
+                last_stable_offset,
+            } => Ok(Response::AbortedTransactions(
+                self.storage
+                    .aborted_transactions(&topition, offset, last_stable_offset)
+                    .await,
+            )),
+            Request::ClusterId => Ok(Response::ClusterId(self.storage.cluster_id().await)),
+            Request::Node => Ok(Response::Node(self.storage.node().await)),
+            Request::AdvertisedListener => Ok(Response::AdvertisedListener(
+                self.storage.advertised_listener().await,
+            )),
+            Request::DeleteUserScramCredential { user, mechanism } => {
+                Ok(Response::DeleteUserScramCredential(
+                    self.storage
+                        .delete_user_scram_credential(&user[..], mechanism)
+                        .await,
+                ))
+            }
+            Request::UpsertUserScramCredential {
+                user,
+                mechanism,
+                credential,
+            } => Ok(Response::UpsertUserScramCredential(
+                self.storage
+                    .upsert_user_scram_credential(&user[..], mechanism, credential)
+                    .await,
+            )),
+            Request::UserScramCredential { user, mechanism } => Ok(Response::UserScramCredential(
+                self.storage
+                    .user_scram_credential(&user[..], mechanism)
+                    .await,
+            )),
+            Request::Ping => Ok(Response::Ping(self.storage.ping().await)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{assert_matches, future::pending, sync::Mutex};
+
+    use super::*;
+    use crate::{
+        fetched::{self, FetchUntilDeadline as _},
+        storage_double::storage_double,
+    };
+    use nisshi_sans_io::record::inflated;
+    use tokio::{
+        sync::oneshot::{self, error::TryRecvError},
+        time::{Duration, Instant},
+    };
+
+    /// Pins the `operation` label each request is counted under on the
+    /// `nisshi_storage_channel_*` metrics: the name of the [`Storage`] method it calls.
+    #[test]
+    fn operation_is_the_storage_method() {
+        let topition = Topition::new("t", 0);
+        let topic = TopicId::Name("t".into());
+
+        // The receiving end is unused: the test only names each request's operation.
+        let (fetched_sender, _fetched_receiver) = fetched::channel();
+
+        let expected = [
+            (
+                Request::RegisterBroker(BrokerRegistrationRequest {
+                    broker_id: 111,
+                    cluster_id: "c".into(),
+                    incarnation_id: Uuid::nil(),
+                    rack: None,
+                }),
+                "register_broker",
+            ),
+            (
+                Request::IncrementalAlterResource(AlterConfigsResource::default()),
+                "incremental_alter_resource",
+            ),
+            (
+                Request::CreateTopic {
+                    topic: CreatableTopic::default(),
+                    validate_only: false,
+                },
+                "create_topic",
+            ),
+            (Request::DeleteRecords(vec![]), "delete_records"),
+            (Request::DeleteTopic(topic.clone()), "delete_topic"),
+            (Request::Brokers, "brokers"),
+            (
+                Request::Produce {
+                    transaction_id: None,
+                    topition: topition.clone(),
+                    batch: deflated::Batch::default(),
+                    inflated: None,
+                },
+                "produce",
+            ),
+            (
+                Request::Fetch {
+                    topition: topition.clone(),
+                    offset: 0,
+                    min_bytes: 0,
+                    max_bytes: 0,
+                    isolation: IsolationLevel::default(),
+                    fetched_sender,
+                },
+                "fetch",
+            ),
+            (Request::OffsetStage(topition.clone()), "offset_stage"),
+            (
+                Request::CurrentOffsetStage(topition.clone()),
+                "current_offset_stage",
+            ),
+            (
+                Request::ListOffsets {
+                    isolation_level: IsolationLevel::default(),
+                    offsets: vec![],
+                },
+                "list_offsets",
+            ),
+            (
+                Request::OffsetCommit {
+                    group_id: "g".into(),
+                    retention_time_ms: None,
+                    offsets: vec![],
+                },
+                "offset_commit",
+            ),
+            (
+                Request::CommittedOffsetTopitions("g".into()),
+                "committed_offset_topitions",
+            ),
+            (
+                Request::OffsetFetch {
+                    group_id: None,
+                    topics: vec![],
+                    require_stable: None,
+                },
+                "offset_fetch",
+            ),
+            (
+                Request::PendingTxnOffsets("g".into()),
+                "pending_txn_offsets",
+            ),
+            (Request::Metadata(None), "metadata"),
+            (
+                Request::DescribeConfig {
+                    name: "t".into(),
+                    resource: ConfigResource::Topic,
+                    keys: None,
+                },
+                "describe_config",
+            ),
+            (
+                Request::DescribeTopicPartitions {
+                    topics: None,
+                    partition_limit: 0,
+                    cursor: None,
+                },
+                "describe_topic_partitions",
+            ),
+            (Request::ListGroups, "list_groups"),
+            (Request::DeleteGroups(None), "delete_groups"),
+            (
+                Request::DescribeGroups {
+                    group_ids: None,
+                    include_authorized_operations: false,
+                },
+                "describe_groups",
+            ),
+            (Request::GroupWithVersion("g".into()), "group_with_version"),
+            (
+                Request::UpdateGroup {
+                    group_id: "g".into(),
+                    detail: GroupDetail::default(),
+                    version: None,
+                },
+                "update_group",
+            ),
+            (
+                Request::InitProducer {
+                    transaction_id: None,
+                    transaction_timeout_ms: 0,
+                    producer_id: None,
+                    producer_epoch: None,
+                },
+                "init_producer",
+            ),
+            (
+                Request::TxnAddOffsets {
+                    transaction_id: "x".into(),
+                    producer_id: 0,
+                    producer_epoch: 0,
+                    group_id: "g".into(),
+                },
+                "txn_add_offsets",
+            ),
+            (
+                Request::TxnAddPartitions(TxnAddPartitionsRequest::VersionFourPlus {
+                    transactions: vec![],
+                }),
+                "txn_add_partitions",
+            ),
+            (
+                Request::TxnOffsetCommit(TxnOffsetCommitRequest {
+                    transaction_id: "x".into(),
+                    group_id: "g".into(),
+                    producer_id: 0,
+                    producer_epoch: 0,
+                    generation_id: None,
+                    member_id: None,
+                    group_instance_id: None,
+                    topics: vec![],
+                }),
+                "txn_offset_commit",
+            ),
+            (
+                Request::TxnEnd {
+                    transaction_id: "x".into(),
+                    producer_id: 0,
+                    producer_epoch: 0,
+                    committed: true,
+                },
+                "txn_end",
+            ),
+            (Request::Maintain(SystemTime::UNIX_EPOCH), "maintain"),
+            (
+                Request::MaintainTransactions(SystemTime::UNIX_EPOCH),
+                "maintain_transactions",
+            ),
+            (
+                Request::AbortedTransactions {
+                    topition,
+                    offset: 0,
+                    last_stable_offset: 0,
+                },
+                "aborted_transactions",
+            ),
+            (Request::ClusterId, "cluster_id"),
+            (Request::Node, "node"),
+            (Request::AdvertisedListener, "advertised_listener"),
+            (
+                Request::DeleteUserScramCredential {
+                    user: "u".into(),
+                    mechanism: ScramMechanism::Scram256,
+                },
+                "delete_user_scram_credential",
+            ),
+            (
+                Request::UpsertUserScramCredential {
+                    user: "u".into(),
+                    mechanism: ScramMechanism::Scram256,
+                    credential: ScramCredential::default(),
+                },
+                "upsert_user_scram_credential",
+            ),
+            (
+                Request::UserScramCredential {
+                    user: "u".into(),
+                    mechanism: ScramMechanism::Scram256,
+                },
+                "user_scram_credential",
+            ),
+            (Request::Ping, "ping"),
+        ];
+
+        for (request, label) in expected {
+            assert_eq!(label, request.operation().as_str(), "{request:?}");
+        }
+    }
+
+    /// Reads through `storage` until `deadline`, and returns how many batches the read sent.
+    async fn fetch(storage: &RequestChannelService, deadline: Instant) -> Result<usize> {
+        storage
+            .fetch_until_deadline(
+                &Topition::new("abc", 0),
+                0,
+                1,
+                1024,
+                IsolationLevel::ReadUncommitted,
+                deadline,
+            )
+            .await
+            .map(|read| read.batches.len())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_stops_waiting_for_room_on_the_channel_at_its_deadline() -> Result<()> {
+        let (tx, _rx) = bounded_channel(1);
+
+        // The request fills the channel, and nothing receives it, so the fetch never gets room.
+        let (response, _) = oneshot::channel();
+        let (started, _) = oneshot::channel();
+        tx.send(ChannelRequest {
+            request: Request::Brokers,
+            response,
+            started,
+        })
+        .await
+        .expect("room on the channel");
+
+        let storage = RequestChannelService::new(tx);
+
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_millis(500);
+
+        assert_eq!(0, fetch(&storage, deadline).await?);
+        assert_eq!(Duration::from_millis(500), started_at.elapsed());
+
+        Ok(())
+    }
+
+    /// The read on the other end of the channel sends its batches to the fetch directly.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_receives_what_the_read_behind_the_channel_sends() -> Result<()> {
+        let (tx, mut rx) = bounded_channel(1);
+        let storage = RequestChannelService::new(tx);
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+
+        let answer = async {
+            let ChannelRequest {
+                request,
+                response: reply,
+                started,
+            } = rx.recv().await.expect("a fetch request");
+
+            started.send(()).expect("the reader");
+
+            let Request::Fetch { fetched_sender, .. } = request else {
+                panic!("{request:?}");
+            };
+
+            let batch = inflated::Batch::builder()
+                .build()
+                .and_then(deflated::Batch::try_from)
+                .expect("a batch");
+
+            let mut data = fetched_sender
+                .send_offsets(OffsetStage::default())
+                .await
+                .expect("the reader");
+            data.send_batch(batch).await.expect("the reader");
+            drop(data);
+
+            reply.send(Ok(Response::Fetch(Ok(())))).expect("the reader");
+        };
+
+        let (fetched, ()) = tokio::join!(fetch(&storage, deadline), answer);
+
+        assert_eq!(1, fetched?);
+
+        Ok(())
+    }
+
+    /// The fetch stops waiting at the deadline when the service has not started the read by then,
+    /// and answers with no batches.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_stops_waiting_for_a_read_that_has_not_started_by_its_deadline() -> Result<()> {
+        let (tx, mut rx) = bounded_channel(1);
+        let storage = RequestChannelService::new(tx);
+
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_millis(500);
+
+        // The service receives the read but never starts it, as when it serves an earlier
+        // request until after the deadline.
+        let held = async { rx.recv().await.expect("a fetch request") };
+
+        let (fetched, _held) = tokio::join!(fetch(&storage, deadline), held);
+
+        assert_eq!(0, fetched?);
+        assert_eq!(Duration::from_millis(500), started_at.elapsed());
+
+        Ok(())
+    }
+
+    /// A storage double whose `fetch` never finishes. The read holds the `read_alive` sender, so
+    /// the receiver sees its channel close when the read is dropped.
+    #[derive(Debug)]
+    struct NeverEnds {
+        read_alive: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    storage_double!(NeverEnds, async fn fetch(&self, _fetched_sender) {
+        let _read_alive = self.read_alive.lock()?.take();
+        pending().await
+    });
+
+    /// A read behind the storage channel ends when its reader stops reading. A task of its own
+    /// runs the read, so nothing else would drop it, and the channel would wait for it forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_behind_the_channel_ends_when_its_reader_stops() -> Result<()> {
+        // `read_ended` closes when the read drops the sender that it takes from the double. It
+        // stays open if the read never starts, because the double then keeps the sender.
+        let (read_alive, mut read_ended) = oneshot::channel::<()>();
+
+        let service = RequestStorageService::new(NeverEnds {
+            read_alive: Mutex::new(Some(read_alive)),
+        });
+
+        let (fetched_sender, receiver) = fetched::channel();
+
+        let serving = service.serve(Request::Fetch {
+            topition: Topition::new("abc", 0),
+            offset: 0,
+            min_bytes: 1,
+            max_bytes: 1024,
+            isolation: IsolationLevel::ReadUncommitted,
+            fetched_sender,
+        });
+
+        // The reader has stopped reading before the read starts.
+        drop(receiver);
+
+        let served = tokio::time::timeout(Duration::from_secs(1), serving).await;
+
+        assert_matches!(served, Ok(Ok(Response::Fetch(Ok(())))));
+        assert_matches!(
+            read_ended.try_recv(),
+            Err(TryRecvError::Closed),
+            "the read was not dropped"
+        );
+
+        Ok(())
+    }
+
+    /// A storage double whose read sends its offsets and one batch, and then returns `outcome`.
+    #[derive(Clone, Debug)]
+    struct SendsThenReturns {
+        outcome: Result<()>,
+    }
+
+    storage_double!(SendsThenReturns, async fn fetch(&self, fetched_sender) {
+        let batch = inflated::Batch::builder()
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let mut data = fetched_sender
+            .send_offsets(OffsetStage {
+                last_stable: 1,
+                high_watermark: 1,
+                log_start: 0,
+            })
+            .await?;
+        data.send_batch(batch).await?;
+        drop(data);
+
+        self.outcome.clone()
+    });
+
+    /// Returns a client of a storage channel whose service loop serves `storage`, as mpsc mode
+    /// runs it.
+    fn channel_to(storage: SendsThenReturns) -> RequestChannelService {
+        let (sender, receiver) = bounded_channel(1);
+
+        let server = ChannelRequestLayer::new(CancellationToken::new())
+            .into_layer(RequestStorageService::new(storage));
+
+        _ = tokio::spawn(async move { server.serve(receiver).await });
+
+        RequestChannelService::new(sender)
+    }
+
+    /// A read behind the storage channel that sends and then finishes answers as soon as it
+    /// finishes, with what it sent, instead of at its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_behind_the_channel_answers_when_it_finishes() -> Result<()> {
+        let storage = channel_to(SendsThenReturns { outcome: Ok(()) });
+
+        let started_at = Instant::now();
+
+        let read = storage
+            .fetch_until_deadline(
+                &Topition::new("abc", 0),
+                0,
+                1,
+                1024,
+                IsolationLevel::ReadUncommitted,
+                started_at + Duration::from_secs(1),
+            )
+            .await?;
+
+        assert_eq!(None, read.timed_out);
+        assert_eq!(1, read.batches.len());
+        assert_eq!(Duration::ZERO, started_at.elapsed());
+
+        Ok(())
+    }
+
+    /// A read behind the storage channel that fails after it sent data returns the data that it
+    /// sent, with its error.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_behind_the_channel_that_fails_returns_its_data_and_error() -> Result<()> {
+        let storage = channel_to(SendsThenReturns {
+            outcome: Err(Error::Api(ErrorCode::UnknownTopicOrPartition)),
+        });
+
+        let read = storage
+            .fetch_until_deadline_or_failure(
+                &Topition::new("abc", 0),
+                0,
+                1,
+                1024,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await?;
+
+        assert_matches!(
+            read.failed,
+            Some(Error::Api(ErrorCode::UnknownTopicOrPartition))
+        );
+        assert_eq!(1, read.batches.len());
+
+        Ok(())
+    }
+}

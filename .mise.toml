@@ -2,7 +2,7 @@
 # https://mise.jdx.dev/
 
 [tools]
-rust = "1.93"
+rust = "1.98"
 python = "3.12"
 uv = "latest"
 just = "latest"

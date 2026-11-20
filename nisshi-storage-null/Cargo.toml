@@ -1,0 +1,25 @@
+[package]
+name = "nisshi-storage-null"
+description = "Nisshi null storage backend that tracks topic metadata without persisting messages"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+authors.workspace = true
+include.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-storage.workspace = true
+regex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

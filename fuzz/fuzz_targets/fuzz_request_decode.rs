@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 #![no_main]
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use tansu_sans_io::Frame;
+use nisshi_sans_io::Frame;
 
 fuzz_target!(|data: &[u8]| {
     let _ = Frame::request_from_bytes(Bytes::copy_from_slice(data));

@@ -1,18 +1,246 @@
-name: Publish to crates.io
+name: release
+
+# The only workflow a `v*` tag runs. It calls ci.yml for the build and every
+# test, then publishes in order: the version tags on the image, the archives
+# on the GitHub release, then the crates. Each step needs the one before, and
+# the first needs `ci`, `on-main`, `release-tag` and `release-readiness` (the
+# Guardian scan of the tag), so a red run or a Guardian block publishes
+# nothing. A check that must also pass before a release goes in
+# publish-image's `needs`. This workflow creates the GitHub release without a
+# body. The /cut-release skill drafts the body from CHANGELOG.md after the run
+# and sets it with `gh release edit`.
+#
+# Publishing over a failed release-readiness check: when it fails and the
+# other three pass, the `override` job waits in the `release-override`
+# environment, whose required reviewers are repo admins. Approving it
+# publishes from this run, over a Guardian block or a scanner or Guardian
+# outage alike; rejecting it ends the run with nothing published. The
+# environment prevents self-review and admin bypass, so another admin has to
+# approve: whoever pushed the tag or started the re-run can't. The job refuses
+# to run if either setting is off, or if the run records no approval of
+# release-override from another user. GitHub asks for approval again on a re-run,
+# and the deployment log records who approved.
+#
+# The file name stays release.yml: the crates.io trusted publisher is bound
+# to it.
+permissions:
+  contents: read
 on:
   push:
     tags:
       - "v*"
+# One release run per tag, never cancelled part-way through publishing.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  publish:
+  ci:
+    # A called workflow's jobs can't hold more than this job grants, so this
+    # lists every permission a ci.yml job declares: `changes` reads the PR
+    # files, and ci-gate lists the run's jobs for its timings.
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/ci.yml
+
+  # A tag run uses the workflow at the tagged commit, and the `release`
+  # environment checks only that the ref name matches `v*`. This job stops a
+  # `v*` tag pushed on a commit that is not on main from publishing. It does
+  # not stop someone who can edit the workflow at the tagged commit, because
+  # they can remove it; a tag ruleset that restricts who creates `v*` tags is
+  # the control for that. It asks the compare API instead of fetching main,
+  # so it needs no checkout and works with the read-only token whether the
+  # repository is public or private: main is `ahead` of the tagged commit, or
+  # `identical` to it, exactly when the commit is on main.
+  on-main:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...main" --jq .status)
+          case "$status" in
+            ahead|identical) echo "${GITHUB_SHA} is on main (${status})" ;;
+            *) echo "::error::${GITHUB_REF} is at ${GITHUB_SHA}, which is not on main (${status}); nothing is published"; exit 1 ;;
+          esac
+
+  # Fails a tag whose version differs from the tagged commit's Cargo.toml
+  # version, and a stable tag whose CHANGELOG.md section is missing or empty.
+  # See .github/scripts/check-release-tag.sh.
+  release-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash .github/scripts/check-release-tag.sh "${GITHUB_REF_NAME}"
+
+  # The Guardian scan of the tag, in trunk mode: FOSSA and Prisma upload under
+  # the tag's version, then the Guardian gate blocks on its verdict. It waits
+  # for on-main and release-tag, which take seconds, so a tag that can never
+  # publish is never filed in FOSSA or Guardian as trunk.
+  release-readiness:
+    needs: [on-main, release-tag]
+    permissions:
+      contents: read
+      packages: read        # ceiling for guardian-scan's FOSSA job (private scan container)
+      pull-requests: write
+      checks: write
+      statuses: write
+      # Same ceiling as release-readiness-check.yaml: the subset rule applies at
+      # every workflow_call hop. Not a capability this path uses.
+      id-token: write
+    uses: ./.github/workflows/release-readiness-check.yaml # zizmor: ignore[secrets-inherit]
+    # `secrets: inherit` is load-bearing on both hops of this chain. A workflow
+    # reached via `workflow_call` starts with an empty `secrets` context, and
+    # that extends to the called workflow's own `environment:` layer; `inherit`
+    # is what opens it. Without it guardian-scan.yaml's `guardian-trunk` jobs
+    # read every secret as an empty string and every scan job fails. Naming
+    # the secrets instead is not possible: they live in that environment,
+    # which a `uses:` job cannot enter. Nothing on PR CI exercises this path;
+    # only a tag run does.
+    secrets: inherit
+    with:
+      # The qualified ref, not the bare name: actions/checkout resolves a bare
+      # name to a branch before a tag, so a branch named after the version
+      # would be scanned in the tag's place.
+      ref: ${{ github.ref }}
+      version: ${{ github.ref_name }}
+
+  # Runs only when release-readiness failed and everything else passed, and
+  # waits for a repo admin to approve it in the `release-override`
+  # environment. See the header.
+  override:
+    needs: [ci, on-main, release-tag, release-readiness]
+    if: >-
+      ${{ !cancelled() && needs.ci.result == 'success' && needs.on-main.result == 'success'
+      && needs.release-tag.result == 'success' && needs.release-readiness.result == 'failure' }}
+    environment: release-override
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      # A missing environment is created on first use with no reviewers, and
+      # this job then starts without waiting for anyone. Refuse to pass the
+      # publish jobs unless the environment still has its protection. Admin
+      # bypass is on by default and lets any admin start a waiting job without
+      # the reviewers, which looks the same as an approval once the job runs, so
+      # the setting itself is refused.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          env_json=$(gh api "repos/${GITHUB_REPOSITORY}/environments/release-override")
+          rules=$(jq '[.protection_rules[]? | select(.type == "required_reviewers")]' <<<"$env_json")
+          if [ "$(jq length <<<"$rules")" -eq 0 ]; then
+            echo "::error::release-override has no required reviewers; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          if [ "$(jq '[.[] | select(.prevent_self_review == true)] | length' <<<"$rules")" -eq 0 ]; then
+            echo "::error::release-override allows self-review; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          if [ "$(jq '.can_admins_bypass' <<<"$env_json")" != "false" ]; then
+            echo "::error::release-override lets admins bypass its reviewers; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          # The settings checks read the environment as it is now, after GitHub
+          # released this job, so they can't prove that a second person
+          # approved it. This check reads the approvals that the run recorded,
+          # and requires one for release-override from someone other than
+          # whoever pushed the tag or started this attempt.
+          approvals=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals")
+          others=$(jq --arg actor "$GITHUB_ACTOR" --arg trigger "$GITHUB_TRIGGERING_ACTOR" '
+            [.[] | select(.state == "approved" and any(.environments[]; .name == "release-override"))
+              | .user.login | select(. != $actor and . != $trigger)] | length' <<<"$approvals")
+          if [ "$others" -eq 0 ]; then
+            echo "::error::release-override has no approval from anyone but ${GITHUB_ACTOR} or ${GITHUB_TRIGGERING_ACTOR}; not publishing over a failed release-readiness check"
+            exit 1
+          fi
+          echo "::warning::publishing ${GITHUB_REF_NAME} over a failed release-readiness check"
+
+  # The multi-arch image, built from the binaries smoke tested by the same
+  # action as tier-c.yml's `edge-publish`, tagged with the version. `latest` comes with the
+  # semver tags, for a tag that isn't a prerelease.
+  publish-image:
+    needs: [ci, on-main, release-tag, release-readiness, override]
+    if: >-
+      ${{ !cancelled() && needs.ci.result == 'success' && needs.on-main.result == 'success'
+      && needs.release-tag.result == 'success'
+      && (needs.release-readiness.result == 'success' || needs.override.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/publish-image
+        with:
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+  # Attaches the archives to the GitHub release. It is a job of its own so
+  # that `contents: write`, which can create tags the main ruleset doesn't
+  # cover, is held by a job that compiles nothing, and the `release`
+  # environment's deployment policy (`v*` tags) is a second, server-side check
+  # on the ref. The image is pushed first, so a failed upload leaves an image
+  # without a release page until this job is re-run.
+  # Explicit conditions on this job and the next: `override` is skipped on a
+  # passing run, and without them the skip would carry down the chain.
+  github-release:
+    needs: [publish-image]
+    if: ${{ !cancelled() && needs.publish-image.result == 'success' }}
     environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          # Two hyphens: the archives are nisshi-<target>, and docker
+          # build-push-action's build record is `nisshi-io~nisshi~<id>.dockerbuild`.
+          pattern: nisshi-*-*
+          merge-multiple: true
+          path: archives
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          files: |
+            archives/*.tar.gz
+            archives/*.zip
+          fail_on_unmatched_files: true
+          # A semver prerelease (v0.7.0-pre.3) has a hyphen. Marking it keeps
+          # it off "Latest", as publish-image keeps it off the `latest` image.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # Last, because a crates.io publish can't be undone.
+  publish-crates:
+    needs: [github-release]
+    if: ${{ !cancelled() && needs.github-release.result == 'success' }}
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: rust-lang/crates-io-auth-action@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
-      - run: cargo publish --workspace
+      # --no-verify skips cargo's pre-upload build, so no build script runs
+      # while this job holds the crates.io token. The verify step is ci.yml's
+      # cargo-publish-dry-run, which this run's `ci` job has passed on the
+      # tagged commit.
+      - run: cargo publish --locked --no-verify --workspace
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

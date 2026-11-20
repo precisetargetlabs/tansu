@@ -1,0 +1,246 @@
+// Copyright (c) Solace Corporation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::{collections::HashMap, error::Error, str::FromStr};
+
+use crate::{Result, env_var_exp_parser::UrlParser};
+use clap::Subcommand;
+use nisshi_sans_io::ErrorCode;
+use nisshi_topic::{Format, Topic};
+use url::Url;
+
+use super::{DEFAULT_BROKER, client_security::ClientSecurity, output::Output};
+
+#[derive(Clone, Debug, Subcommand)]
+pub(super) enum Command {
+    /// Create a topic
+    Create {
+        /// Broker URL
+        #[arg(long, default_value = DEFAULT_BROKER, value_parser = UrlParser)]
+        broker: Url,
+
+        /// The name of the topic to create
+        #[clap(value_parser)]
+        name: String,
+
+        /// The number of partitions to create
+        #[arg(long, default_value = "3")]
+        partitions: i32,
+
+        #[arg(long, value_parser = parse_key_val::<String, String>)]
+        config: Vec<(String, String)>,
+
+        /// Print no confirmation on success (errors still print). With --output json the
+        /// result is printed anyway
+        #[arg(long)]
+        silent: bool,
+
+        /// Print a confirmation line, or the broker's result as a JSON array for scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+        #[command(flatten)]
+        security: ClientSecurity,
+    },
+
+    /// Delete an existing topic
+    Delete {
+        /// Broker URL
+        #[arg(long, default_value = DEFAULT_BROKER, value_parser = UrlParser)]
+        broker: Url,
+
+        /// The name of the topic to delete
+        #[clap(value_parser)]
+        name: String,
+
+        /// Print nothing, or the broker's result as a JSON array for scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+        #[command(flatten)]
+        security: ClientSecurity,
+    },
+
+    /// List existing topics
+    List {
+        /// Broker URL
+        #[arg(long, default_value = DEFAULT_BROKER, value_parser = UrlParser)]
+        broker: Url,
+
+        /// Print a table of topics and partition counts, or the broker's metadata as JSON
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+        #[command(flatten)]
+        security: ClientSecurity,
+    },
+}
+
+fn format(output: Output) -> Format {
+    match output {
+        Output::Table => Format::Table,
+        Output::Json => Format::Json,
+    }
+}
+
+impl TryFrom<Command> for Topic {
+    type Error = crate::Error;
+
+    fn try_from(value: Command) -> Result<Self> {
+        Ok(match value {
+            Command::Create {
+                broker,
+                name,
+                partitions,
+                config,
+                silent,
+                output,
+                security,
+            } => Topic::create()
+                .broker(broker)
+                .security(security.build()?)
+                .name(name)
+                .partitions(partitions)
+                .config(HashMap::from_iter(config))
+                .confirm(!silent)
+                .format(format(output))
+                .build(),
+
+            Command::Delete {
+                broker,
+                name,
+                output,
+                security,
+            } => Topic::delete()
+                .broker(broker)
+                .security(security.build()?)
+                .name(name)
+                .format(format(output))
+                .build(),
+
+            Command::List {
+                broker,
+                output,
+                security,
+            } => Topic::list()
+                .broker(broker)
+                .security(security.build()?)
+                .format(format(output))
+                .build(),
+        })
+    }
+}
+
+impl Command {
+    pub(super) async fn main(self) -> Result<ErrorCode> {
+        Topic::try_from(self)?.main().await.map_err(Into::into)
+    }
+}
+
+/// Parse a single key-value pair
+fn parse_key_val<T, U>(s: &str) -> Result<(T, U), Box<dyn Error + Send + Sync + 'static>>
+where
+    T: FromStr,
+    T::Err: Error + Send + Sync + 'static,
+    U: FromStr,
+    U::Err: Error + Send + Sync + 'static,
+{
+    let pos = s
+        .find('=')
+        .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{s}`"))?;
+    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, Output};
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    fn create_is_silent(args: &[&str]) -> bool {
+        let Wrapper { command } =
+            Wrapper::try_parse_from(std::iter::once("topic").chain(args.iter().copied()))
+                .expect("arguments parse");
+
+        match command {
+            Command::Create { silent, .. } => silent,
+            Command::Delete { .. } | Command::List { .. } => panic!("expected create: {args:?}"),
+        }
+    }
+
+    #[test]
+    fn create_prints_its_confirmation_unless_silent() {
+        assert!(!create_is_silent(&["create", "test"]));
+        assert!(create_is_silent(&["create", "test", "--silent"]));
+    }
+
+    fn list_output(args: &[&str]) -> Result<Output, clap::Error> {
+        let Wrapper { command } =
+            Wrapper::try_parse_from(std::iter::once("topic").chain(args.iter().copied()))?;
+
+        match command {
+            Command::List { output, .. } => Ok(output),
+            Command::Create { .. } | Command::Delete { .. } => panic!("expected list: {args:?}"),
+        }
+    }
+
+    #[test]
+    fn list_prints_a_table_unless_asked_for_json() {
+        assert_eq!(Output::Table, list_output(&["list"]).unwrap());
+        assert_eq!(
+            Output::Json,
+            list_output(&["list", "--output", "json"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn list_rejects_an_unknown_output() {
+        assert_eq!(
+            clap::error::ErrorKind::InvalidValue,
+            list_output(&["list", "--output", "yaml"])
+                .unwrap_err()
+                .kind()
+        );
+    }
+
+    fn output(args: &[&str]) -> Result<Output, clap::Error> {
+        let Wrapper { command } =
+            Wrapper::try_parse_from(std::iter::once("topic").chain(args.iter().copied()))?;
+
+        match command {
+            Command::List { output, .. }
+            | Command::Create { output, .. }
+            | Command::Delete { output, .. } => Ok(output),
+        }
+    }
+
+    #[test]
+    fn create_and_delete_print_a_table_unless_asked_for_json() {
+        for subcommand in ["create", "delete"] {
+            assert_eq!(Output::Table, output(&[subcommand, "t"]).unwrap());
+            assert_eq!(
+                Output::Json,
+                output(&[subcommand, "t", "--output", "json"]).unwrap()
+            );
+            assert_eq!(
+                clap::error::ErrorKind::InvalidValue,
+                output(&[subcommand, "t", "--output", "yaml"])
+                    .unwrap_err()
+                    .kind()
+            );
+        }
+    }
+}

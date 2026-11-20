@@ -1,0 +1,78 @@
+# Metrics
+
+Metrics are exported over OTLP/HTTP when `--otlp-endpoint-url` (or
+`OTEL_EXPORTER_OTLP_ENDPOINT`) is set. `v1/metrics` is appended to the URL's
+path, so `https://collector:4318` and `https://gateway/otlp` export to
+`https://collector:4318/v1/metrics` and `https://gateway/otlp/v1/metrics`.
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is not read. Collector credentials go
+in `OTEL_EXPORTER_OTLP_HEADERS`.
+
+The exported resource honours the standard OpenTelemetry environment
+variables. Every `key=value` pair in `OTEL_RESOURCE_ATTRIBUTES` is attached
+as given; values are not percent-decoded, and entries without a `=` are
+ignored with a warning. `service.name` is resolved as `OTEL_SERVICE_NAME`,
+then `service.name` in `OTEL_RESOURCE_ATTRIBUTES`, then the default for the
+subcommand (`nisshi-broker`, or `nisshi-proxy` / `nisshi-generator` for
+`proxy` and `generator`). Unset, empty or whitespace-only values fall through
+to the next source. The endpoint, `service.name` and attribute names are
+logged at `info` on startup. Resource attributes are sent with every export,
+so use an `https` endpoint when they carry anything sensitive.
+
+```shell
+OTEL_EXPORTER_OTLP_ENDPOINT=https://collector:4318/ \
+OTEL_SERVICE_NAME=kafka-broker \
+OTEL_RESOURCE_ATTRIBUTES=service.version=0.7.0,deployment.environment.name=staging \
+nisshi broker
+```
+
+Note for existing deployments: before 0.7 `service.name` was always
+`nisshi-broker` and these variables were ignored. If `OTEL_SERVICE_NAME` or
+`OTEL_RESOURCE_ATTRIBUTES` is already set in the broker's environment, for
+example injected pod-wide for another agent, its series move to that name on
+upgrade and dashboards or alerts keyed on `nisshi-broker` go quiet. Unset the
+inherited variable or set `OTEL_SERVICE_NAME=nisshi-broker`. Rolling back
+reverts to `nisshi-broker` regardless of these variables. On shutdown the
+broker now flushes pending metrics before exiting.
+
+## Produce deadline
+
+A Produce request that waits for an answer has a deadline, see the Produce row of
+[Compatibility](compatibility.md).
+
+- `nisshi_produce_deadline_exceeded` counts the partitions that answered
+  `REQUEST_TIMED_OUT` because of the deadline. The `stage` attribute is `not_started`
+  when the deadline passed before the broker started a write, `slot_wait` when it
+  passed while the partition waited for a place among the writes of its request,
+  because the writes ahead of it were slow (the log has a `warn` line with the topic
+  and the partition), `budget_wait` when it
+  passed while the partition waited for the decoded-batch budget (see
+  [Storage](storage.md)), `writing` when it answered while a write ran, and `in_flight`
+  when it did not start a write because an earlier write from the same idempotent
+  producer to the partition, left running at a deadline, had not ended.
+- `nisshi_produce_detached_writes` is the number of writes that run on after the broker
+  answered their request at the deadline. One request can leave up to 4 of them. A value that stays above zero means a
+  storage backend call that does not end, and that broker takes no idempotent write
+  from the same producer to the partition until it does.
+
+## Group coordinator
+
+`nisshi_group_coordinator_requests` counts the work of the consumer group coordinator, by the
+`method` attribute:
+
+- The name of a request counts each request: `join`, `sync`, `heartbeat`, `leave`,
+  `offset_commit`, `offset_fetch`, `delete_groups`, `list_groups`, `describe_groups`, and
+  `txn_offset_commit_fence` for the group check of a `TxnOffsetCommit`.
+- `<request>_loop` counts each read of the group by `join`, `sync`, `heartbeat`, `leave` and
+  `offset_commit`. A request reads the group again after a lost write, and a held `JoinGroup` or
+  `SyncGroup` reads it again while it waits.
+- `join_held` and `sync_held` count each wait of a held `JoinGroup` or `SyncGroup`.
+- `<request>_outdated` counts each write of the group that lost to a change by another request
+  or another broker.
+- `join_invalid_session_timeout` counts each `JoinGroup` that answered `INVALID_SESSION_TIMEOUT`.
+- `<request>_failed` counts each `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`,
+  `OffsetCommit` or `DeleteGroups` that answered an error code because storage or the broker
+  failed: `join_failed`, `sync_failed`, `heartbeat_failed`, `leave_failed`,
+  `offset_commit_failed` and `delete_groups_failed`. A count that keeps rising points at
+  storage that the broker cannot reach. The log has the line `the group request failed`, with the
+  request, the group id, the member id and the error: at `warn` at most once in each 10 seconds
+  for each request when a retry may clear the failure, and at `error` each time when it cannot.
